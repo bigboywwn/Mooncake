@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cstdlib>
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -462,7 +463,19 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                 return std::nullopt;
         }
     } else {
-        future = submitFileReadOperation(replica, slices, op_code);
+        if (replica.is_disk_replica()) {
+            future = submitFileReadOperation(replica, slices, op_code);
+        } else if (replica.is_ssd_pool_replica()) {
+            LOG(ERROR) << "SSD pool transfer in TransferSubmitter is disabled. "
+                          "Use store-layer SsdIoEngine instead.";
+            return std::nullopt;
+        } else if (replica.is_local_disk_replica()) {
+            LOG(ERROR) << "LOCAL_DISK transfer path is not implemented";
+            return std::nullopt;
+        } else {
+            LOG(ERROR) << "Unknown replica type in TransferSubmitter::submit";
+            return std::nullopt;
+        }
     }
 
     // Update metrics on successful submission
@@ -675,6 +688,20 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
 
     VLOG(1) << "Fileread transfer submitted to worker pool with " << file_path;
 
+    return TransferFuture(state);
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitSsdOperation(
+    const Replica::Descriptor& replica, std::vector<Slice>& slices,
+    TransferRequest::OpCode op_code) {
+    (void)replica;
+    (void)slices;
+    (void)op_code;
+
+    auto state = std::make_shared<SsdBlockOperationState>();
+    LOG(ERROR) << "TE SSD path is disabled by design. "
+                  "Use store-layer SsdIoEngine for SSD_POOL I/O.";
+    state->set_completed(ErrorCode::INVALID_REPLICA);
     return TransferFuture(state);
 }
 

@@ -19,6 +19,7 @@
 #include "thread_pool.h"
 #include "transfer_engine.h"
 #include "transfer_task.h"
+#include "ssd/ssd_io_engine.h"
 #include "types.h"
 #include "replica.h"
 #include "master_metric_manager.h"
@@ -460,6 +461,7 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
+    ErrorCode InitSsdIoEngine();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);
@@ -467,6 +469,14 @@ class Client {
                             std::vector<Slice>& slices);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices);
+    ReplicaType SelectSyncAckReplicaType(
+        const std::vector<Replica::Descriptor>& replicas) const;
+    tl::expected<void, ErrorCode> ReadWithFallback(
+        const std::string& object_key, const QueryResult& query_result,
+        std::vector<Slice>& slices);
+    ErrorCode PutDiskReplicaSync(const std::string& key,
+                                 const std::vector<Slice>& slices,
+                                 const DiskDescriptor& disk_descriptor);
 
     /**
      * @brief Prepare and use the storage backend for persisting data
@@ -522,6 +532,10 @@ class Client {
                             const std::vector<Slice>& slices,
                             const Replica::Descriptor& replica);
 
+    void PutToSsdPool(const std::string& object_key,
+                      const std::vector<Slice>& slices,
+                      const SsdExtentDescriptor& ssd_descriptor);
+
     /**
      * @brief Find the first complete replica from a replica list
      * @param replica_list List of replicas to search through
@@ -564,6 +578,7 @@ class Client {
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
+    std::unique_ptr<SsdIoEngine> ssd_io_engine_;
 
     // Mutex to protect mounted_segments_
     std::mutex mounted_segments_mutex_;

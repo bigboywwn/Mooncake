@@ -28,7 +28,8 @@ enum class TransferStrategy {
     LOCAL_MEMCPY = 0,     // Local memory copy using memcpy
     TRANSFER_ENGINE = 1,  // Remote transfer using transfer engine
     FILE_READ = 2,        // File read operation
-    EMPTY = 3
+    SSD_BLOCK = 3,        // Block I/O for SSD pool extents
+    EMPTY = 4
 };
 
 /**
@@ -43,6 +44,8 @@ inline std::ostream& operator<<(std::ostream& os,
             return os << "TRANSFER_ENGINE";
         case TransferStrategy::FILE_READ:
             return os << "FILE_READ";
+        case TransferStrategy::SSD_BLOCK:
+            return os << "SSD_BLOCK";
         default:
             return os << "UNKNOWN";
     }
@@ -164,6 +167,32 @@ class FilereadOperationState : public OperationState {
 
     TransferStrategy get_strategy() const override {
         return TransferStrategy::FILE_READ;
+    }
+};
+
+class SsdBlockOperationState : public OperationState {
+   public:
+    bool is_completed() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return result_.has_value();
+    }
+
+    void set_completed(ErrorCode error_code) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            assert(!result_.has_value());
+            result_.emplace(error_code);
+        }
+        cv_.notify_all();
+    }
+
+    void wait_for_completion() override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return result_.has_value(); });
+    }
+
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::SSD_BLOCK;
     }
 };
 
@@ -437,6 +466,10 @@ class TransferSubmitter {
         const TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submitFileReadOperation(
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        TransferRequest::OpCode op_code);
+
+    std::optional<TransferFuture> submitSsdOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         TransferRequest::OpCode op_code);
 
