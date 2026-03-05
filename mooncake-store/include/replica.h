@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <variant>
 #include <vector>
@@ -29,6 +30,7 @@ using ReplicaID = uint64_t;
 enum class ReplicaType {
     MEMORY,     // Memory replica
     DISK,       // Disk replica
+    SSD_POOL,   // NVMeoF SSD pool replica (block extent)
     LOCAL_DISK  // Local disk replica
 };
 
@@ -39,7 +41,9 @@ inline std::ostream& operator<<(std::ostream& os,
                                 const ReplicaType& replicaType) noexcept {
     static const std::unordered_map<ReplicaType, std::string_view>
         replica_type_strings{{ReplicaType::MEMORY, "MEMORY"},
-                             {ReplicaType::DISK, "DISK"}};
+                             {ReplicaType::DISK, "DISK"},
+                             {ReplicaType::SSD_POOL, "SSD_POOL"},
+                             {ReplicaType::LOCAL_DISK, "LOCAL_DISK"}};
 
     os << (replica_type_strings.count(replicaType)
                ? replica_type_strings.at(replicaType)
@@ -124,6 +128,17 @@ struct LocalDiskReplicaData {
     std::string transport_endpoint;
 };
 
+struct SsdExtentReplicaData {
+    std::string target_endpoint;
+    std::string subsystem_nqn;
+    uint32_t nsid = 0;
+    uint32_t block_size = 4096;
+    uint64_t lba_start = 0;
+    uint64_t lba_count = 0;
+    uint64_t object_size = 0;
+    std::string extent_id;
+};
+
 struct MemoryDescriptor {
     AllocatedBuffer::Descriptor buffer_descriptor;
     YLT_REFL(MemoryDescriptor, buffer_descriptor);
@@ -140,6 +155,19 @@ struct LocalDiskDescriptor {
     uint64_t object_size = 0;
     std::string transport_endpoint;
     YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
+};
+
+struct SsdExtentDescriptor {
+    std::string target_endpoint;
+    std::string subsystem_nqn;
+    uint32_t nsid = 0;
+    uint32_t block_size = 4096;
+    uint64_t lba_start = 0;
+    uint64_t lba_count = 0;
+    uint64_t object_size = 0;
+    std::string extent_id;
+    YLT_REFL(SsdExtentDescriptor, target_endpoint, subsystem_nqn, nsid,
+             block_size, lba_start, lba_count, object_size, extent_id);
 };
 
 class Replica {
@@ -165,9 +193,22 @@ class Replica {
 
     Replica(UUID client_id, uint64_t object_size,
             std::string transport_endpoint, ReplicaStatus status)
-        : data_(LocalDiskReplicaData{client_id, object_size,
+        : id_(next_id_.fetch_add(1)),
+          data_(LocalDiskReplicaData{client_id, object_size,
                                      std::move(transport_endpoint)}),
-          status_(status) {}
+          status_(status),
+          refcnt_(0) {}
+
+    // SSD pool replica constructor
+    Replica(SsdExtentDescriptor extent, ReplicaStatus status)
+        : id_(next_id_.fetch_add(1)),
+          data_(SsdExtentReplicaData{
+              std::move(extent.target_endpoint), std::move(extent.subsystem_nqn),
+              extent.nsid, extent.block_size, extent.lba_start, extent.lba_count,
+              extent.object_size,
+              std::move(extent.extent_id)}),
+          status_(status),
+          refcnt_(0) {}
 
     ~Replica() {
         if (status_ != ReplicaStatus::UNDEFINED && is_disk_replica()) {
@@ -265,6 +306,10 @@ class Replica {
         return replica.is_local_disk_replica();
     }
 
+    [[nodiscard]] bool is_ssd_pool_replica() const {
+        return std::holds_alternative<SsdExtentReplicaData>(data_);
+    }
+
     [[nodiscard]] bool has_invalid_mem_handle() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
@@ -314,11 +359,15 @@ class Replica {
         ReplicaType operator()(const LocalDiskReplicaData&) const {
             return ReplicaType::LOCAL_DISK;
         }
+        ReplicaType operator()(const SsdExtentReplicaData&) const {
+            return ReplicaType::SSD_POOL;
+        }
     };
 
     struct Descriptor {
         ReplicaID id;
-        std::variant<MemoryDescriptor, DiskDescriptor, LocalDiskDescriptor>
+        std::variant<MemoryDescriptor, DiskDescriptor, LocalDiskDescriptor,
+                     SsdExtentDescriptor>
             descriptor_variant;
         ReplicaStatus status;
         YLT_REFL(Descriptor, id, descriptor_variant, status);
@@ -347,6 +396,16 @@ class Replica {
 
         bool is_local_disk_replica() const noexcept {
             return std::holds_alternative<LocalDiskDescriptor>(
+                descriptor_variant);
+        }
+
+        bool is_ssd_pool_replica() noexcept {
+            return std::holds_alternative<SsdExtentDescriptor>(
+                descriptor_variant);
+        }
+
+        bool is_ssd_pool_replica() const noexcept {
+            return std::holds_alternative<SsdExtentDescriptor>(
                 descriptor_variant);
         }
 
@@ -395,6 +454,22 @@ class Replica {
             }
             throw std::runtime_error("Expected LocalDiskDescriptor");
         }
+
+        SsdExtentDescriptor& get_ssd_extent_descriptor() {
+            if (auto* desc = std::get_if<SsdExtentDescriptor>(
+                    &descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected SsdExtentDescriptor");
+        }
+
+        const SsdExtentDescriptor& get_ssd_extent_descriptor() const {
+            if (auto* desc = std::get_if<SsdExtentDescriptor>(
+                    &descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected SsdExtentDescriptor");
+        }
     };
 
    private:
@@ -402,6 +477,7 @@ class Replica {
 
     ReplicaID id_;
     std::variant<MemoryReplicaData, DiskReplicaData, LocalDiskReplicaData>
+                 SsdExtentReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
@@ -440,6 +516,18 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
         desc.descriptor_variant = std::move(local_disk_desc);
+    } else if (is_ssd_pool_replica()) {
+        const auto& ssd_data = std::get<SsdExtentReplicaData>(data_);
+        SsdExtentDescriptor ssd_desc;
+        ssd_desc.target_endpoint = ssd_data.target_endpoint;
+        ssd_desc.subsystem_nqn = ssd_data.subsystem_nqn;
+        ssd_desc.nsid = ssd_data.nsid;
+        ssd_desc.block_size = ssd_data.block_size;
+        ssd_desc.lba_start = ssd_data.lba_start;
+        ssd_desc.lba_count = ssd_data.lba_count;
+        ssd_desc.object_size = ssd_data.object_size;
+        ssd_desc.extent_id = ssd_data.extent_id;
+        desc.descriptor_variant = std::move(ssd_desc);
     }
 
     return desc;
@@ -475,6 +563,22 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
         const auto& disk_data = std::get<DiskReplicaData>(replica.data_);
         os << "type: DISK, file_path: " << disk_data.file_path
            << ", object_size: " << disk_data.object_size;
+    } else if (replica.is_ssd_pool_replica()) {
+        const auto& ssd_data = std::get<SsdExtentReplicaData>(replica.data_);
+        os << "type: SSD_POOL, target_endpoint: " << ssd_data.target_endpoint
+           << ", subsystem_nqn: " << ssd_data.subsystem_nqn
+           << ", nsid: " << ssd_data.nsid
+           << ", block_size: " << ssd_data.block_size
+           << ", lba_start: " << ssd_data.lba_start
+           << ", lba_count: " << ssd_data.lba_count
+           << ", object_size: " << ssd_data.object_size
+           << ", extent_id: " << ssd_data.extent_id;
+    } else if (replica.is_local_disk_replica()) {
+        const auto& local_disk_data =
+            std::get<LocalDiskReplicaData>(replica.data_);
+        os << "type: LOCAL_DISK, client_id: " << local_disk_data.client_id
+           << ", object_size: " << local_disk_data.object_size
+           << ", transport_endpoint: " << local_disk_data.transport_endpoint;
     }
 
     os << ", refcnt: " << replica.refcnt_.load() << " }";

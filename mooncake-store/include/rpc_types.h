@@ -1,5 +1,9 @@
 #pragma once
 
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "types.h"
 #include "replica.h"
 #include "task_manager.h"
@@ -57,6 +61,37 @@ struct GetStorageConfigResponse {
           quota_bytes(quota) {}
 };
 YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
+
+struct GetTieredStorageConfigResponse {
+    std::vector<std::string> enabled_tiers;
+    std::string nvmeof_client_impl;
+    int32_t spdk_reactor_cores;
+    uint32_t queue_limit;
+    uint32_t io_timeout_ms;
+    bool auto_fallback_enabled;
+
+    GetTieredStorageConfigResponse()
+        : nvmeof_client_impl("spdk"),
+          spdk_reactor_cores(1),
+          queue_limit(1024),
+          io_timeout_ms(5000),
+          auto_fallback_enabled(false) {}
+
+    GetTieredStorageConfigResponse(std::vector<std::string> enabled_tiers_param,
+                                   std::string impl, int32_t reactor_cores,
+                                   uint32_t queue_limit_param,
+                                   uint32_t io_timeout_ms_param,
+                                   bool fallback_enabled)
+        : enabled_tiers(std::move(enabled_tiers_param)),
+          nvmeof_client_impl(std::move(impl)),
+          spdk_reactor_cores(reactor_cores),
+          queue_limit(queue_limit_param),
+          io_timeout_ms(io_timeout_ms_param),
+          auto_fallback_enabled(fallback_enabled) {}
+};
+YLT_REFL(GetTieredStorageConfigResponse, enabled_tiers, nvmeof_client_impl,
+         spdk_reactor_cores, queue_limit, io_timeout_ms,
+         auto_fallback_enabled);
 
 /**
  * @brief Response structure for CopyStart operation
@@ -158,5 +193,4 @@ struct BatchGetOffloadObjectResponse {
 };
 YLT_REFL(BatchGetOffloadObjectResponse, pointers, transfer_engine_addr,
          gc_ttl_ms);
-
 }  // namespace mooncake

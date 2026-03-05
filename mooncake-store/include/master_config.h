@@ -25,6 +25,8 @@ struct MasterConfig {
     bool allow_evict_soft_pinned_objects;
     double eviction_ratio;
     double eviction_high_watermark_ratio;
+    double ssd_eviction_ratio;
+    double ssd_eviction_high_watermark_ratio;
     int64_t client_live_ttl_sec;
 
     bool enable_ha;
@@ -112,6 +114,9 @@ class MasterServiceSupervisorConfig {
     uint64_t processing_task_timeout_sec =
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
     uint32_t max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS;
+    double ssd_eviction_ratio = DEFAULT_EVICTION_RATIO;
+    double ssd_eviction_high_watermark_ratio =
+        DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
@@ -138,6 +143,9 @@ class MasterServiceSupervisorConfig {
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        ssd_eviction_ratio = config.ssd_eviction_ratio;
+        ssd_eviction_high_watermark_ratio =
+            config.ssd_eviction_high_watermark_ratio;
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_offload = config.enable_offload;
         rpc_port = static_cast<int>(config.rpc_port);
@@ -240,6 +248,9 @@ class WrappedMasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double ssd_eviction_ratio = DEFAULT_EVICTION_RATIO;
+    double ssd_eviction_high_watermark_ratio =
+        DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
@@ -291,6 +302,9 @@ class WrappedMasterServiceConfig {
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        ssd_eviction_ratio = config.ssd_eviction_ratio;
+        ssd_eviction_high_watermark_ratio =
+            config.ssd_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
@@ -360,6 +374,9 @@ class WrappedMasterServiceConfig {
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        ssd_eviction_ratio = config.ssd_eviction_ratio;
+        ssd_eviction_high_watermark_ratio =
+            config.ssd_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha =
@@ -406,6 +423,9 @@ class MasterServiceConfigBuilder {
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio_ =
+        DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double ssd_eviction_ratio_ = DEFAULT_EVICTION_RATIO;
+    double ssd_eviction_high_watermark_ratio_ =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version_ = 0;
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
@@ -467,6 +487,17 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_eviction_high_watermark_ratio(
         double ratio) {
         eviction_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_ssd_eviction_ratio(double ratio) {
+        ssd_eviction_ratio_ = ratio;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_ssd_eviction_high_watermark_ratio(
+        double ratio) {
+        ssd_eviction_high_watermark_ratio_ = ratio;
         return *this;
     }
 
@@ -639,6 +670,9 @@ class MasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double ssd_eviction_ratio = DEFAULT_EVICTION_RATIO;
+    double ssd_eviction_high_watermark_ratio =
+        DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
@@ -686,6 +720,9 @@ class MasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        ssd_eviction_ratio = config.ssd_eviction_ratio;
+        ssd_eviction_high_watermark_ratio =
+            config.ssd_eviction_high_watermark_ratio;
         view_version = config.view_version;
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
@@ -737,6 +774,9 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
+    config.ssd_eviction_ratio = ssd_eviction_ratio_;
+    config.ssd_eviction_high_watermark_ratio =
+        ssd_eviction_high_watermark_ratio_;
     config.view_version = view_version_;
     config.client_live_ttl_sec = client_live_ttl_sec_;
     config.enable_ha = enable_ha_;
