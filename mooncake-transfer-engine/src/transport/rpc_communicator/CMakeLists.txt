@@ -1,6 +1,7 @@
 file(GLOB CORO_RPC_SOURCES "*.cpp")
 
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(pybind11 CONFIG QUIET)
 
 add_library(rpc_communicator OBJECT ${CORO_RPC_SOURCES})
 
@@ -22,6 +23,8 @@ if(TARGET pybind11::headers)
     target_link_libraries(rpc_communicator PRIVATE pybind11::headers)
 elseif(DEFINED pybind11_INCLUDE_DIR)
     target_include_directories(rpc_communicator PRIVATE ${pybind11_INCLUDE_DIR})
+elseif(DEFINED pybind11_INCLUDE_DIRS)
+    target_include_directories(rpc_communicator PRIVATE ${pybind11_INCLUDE_DIRS})
 else()
     set(_PYBIND11_DIR "")
     if(EXISTS "${CMAKE_SOURCE_DIR}/extern/pybind11/include/pybind11/pybind11.h")

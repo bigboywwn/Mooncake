@@ -1,4 +1,5 @@
 file(GLOB SOURCES "*.cpp")
+find_package(Python3 COMPONENTS Interpreter Development Development.Module REQUIRED)
 set(PYTHON_EXECUTABLE "python3")
 execute_process(
     COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print([s for s in sys.path if 'packages' in s][0])"
