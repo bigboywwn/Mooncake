@@ -476,7 +476,7 @@ class Replica {
     inline static std::atomic<ReplicaID> next_id_{1};
 
     ReplicaID id_;
-    std::variant<MemoryReplicaData, DiskReplicaData, LocalDiskReplicaData>
+    std::variant<MemoryReplicaData, DiskReplicaData, LocalDiskReplicaData,
                  SsdExtentReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
