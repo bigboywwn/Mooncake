@@ -1025,7 +1025,8 @@ bool MasterService::ReleaseSsdReplicasForObject(ObjectMetadata& metadata,
                                                 int64_t& released_bytes) {
     std::vector<std::pair<std::string, uint64_t>> extents_to_release;
     metadata.VisitReplicas(
-        &Replica::fn_is_ssd_pool_replica, [&](const Replica& replica) {
+        [](const Replica& replica) { return replica.is_ssd_pool_replica(); },
+        [&](const Replica& replica) {
             const auto desc = replica.get_descriptor().get_ssd_extent_descriptor();
             extents_to_release.emplace_back(desc.extent_id,
                                             ReplicaSsdBytes(replica));
@@ -3344,28 +3345,31 @@ void MasterService::BatchEvictSsd(double evict_ratio_target,
         evict_ratio_lowerbound = evict_ratio_target;
     }
 
-    auto now = std::chrono::steady_clock::now();
+    auto now = std::chrono::system_clock::now();
     long evicted_count = 0;
     long object_count = 0;
     int64_t total_freed_size = 0;
-    std::vector<std::chrono::steady_clock::time_point> no_pin_objects;
-    std::vector<std::chrono::steady_clock::time_point> soft_pin_objects;
+    std::vector<std::chrono::system_clock::time_point> no_pin_objects;
+    std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
 
     size_t start_idx = rand() % metadata_shards_.size();
+    auto can_evict_ssd = [&](const ObjectMetadata& metadata) {
+        return metadata.IsLeaseExpired(now) && metadata.HasSsdReplica() &&
+               !metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE).has_value() &&
+               CanEvictSsdReplicaSafely(metadata);
+    };
 
     // First pass: only non-soft-pinned objects.
     for (size_t i = 0; i < metadata_shards_.size(); i++) {
-        auto& shard = metadata_shards_[(start_idx + i) % metadata_shards_.size()];
-        MutexLocker lock(&shard.mutex);
+        MetadataShardAccessorRW shard(
+            this, (start_idx + i) % metadata_shards_.size());
 
-        std::vector<std::chrono::steady_clock::time_point> candidates;
+        std::vector<std::chrono::system_clock::time_point> candidates;
         long shard_evictable_count = 0;
-        for (auto it = shard.metadata.begin(); it != shard.metadata.end(); ++it) {
+        for (auto it = shard->metadata.begin(); it != shard->metadata.end();
+             ++it) {
             auto& metadata = it->second;
-            if (!metadata.IsLeaseExpired(now) || !metadata.HasSsdReplica() ||
-                metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                          ReplicaType::SSD_POOL) ||
-                !CanEvictSsdReplicaSafely(metadata)) {
+            if (!can_evict_ssd(metadata)) {
                 continue;
             }
 
@@ -3388,14 +3392,10 @@ void MasterService::BatchEvictSsd(double evict_ratio_target,
                              candidates.end());
             auto target_timeout = candidates[evict_num - 1];
 
-            auto it = shard.metadata.begin();
-            while (it != shard.metadata.end()) {
+            auto it = shard->metadata.begin();
+            while (it != shard->metadata.end()) {
                 auto& metadata = it->second;
-                if (!metadata.IsLeaseExpired(now) || metadata.IsSoftPinned(now) ||
-                    !metadata.HasSsdReplica() ||
-                    metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                              ReplicaType::SSD_POOL) ||
-                    !CanEvictSsdReplicaSafely(metadata)) {
+                if (!can_evict_ssd(metadata) || metadata.IsSoftPinned(now)) {
                     ++it;
                     continue;
                 }
@@ -3407,7 +3407,7 @@ void MasterService::BatchEvictSsd(double evict_ratio_target,
                                                 released_key_count,
                                                 released_bytes);
                     if (!metadata.IsValid()) {
-                        it = shard.metadata.erase(it);
+                        it = shard->metadata.erase(it);
                     } else {
                         ++it;
                     }
@@ -3440,26 +3440,20 @@ void MasterService::BatchEvictSsd(double evict_ratio_target,
 
             for (size_t i = 0;
                  i < metadata_shards_.size() && target_evict_num > 0; i++) {
-                auto& shard =
-                    metadata_shards_[(start_idx + i) % metadata_shards_.size()];
-                MutexLocker lock(&shard.mutex);
-                auto it = shard.metadata.begin();
-                while (it != shard.metadata.end() && target_evict_num > 0) {
+                MetadataShardAccessorRW shard(
+                    this, (start_idx + i) % metadata_shards_.size());
+                auto it = shard->metadata.begin();
+                while (it != shard->metadata.end() && target_evict_num > 0) {
                     auto& metadata = it->second;
                     if (metadata.lease_timeout <= target_timeout &&
-                        metadata.IsLeaseExpired(now) &&
-                        !metadata.IsSoftPinned(now) &&
-                        metadata.HasSsdReplica() &&
-                        !metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                                   ReplicaType::SSD_POOL) &&
-                        CanEvictSsdReplicaSafely(metadata)) {
+                        can_evict_ssd(metadata) && !metadata.IsSoftPinned(now)) {
                         int64_t released_key_count = 0;
                         int64_t released_bytes = 0;
                         ReleaseSsdReplicasForObject(metadata, it->first, "evict",
                                                     released_key_count,
                                                     released_bytes);
                         if (!metadata.IsValid()) {
-                            it = shard.metadata.erase(it);
+                            it = shard->metadata.erase(it);
                         } else {
                             ++it;
                         }
@@ -3482,16 +3476,12 @@ void MasterService::BatchEvictSsd(double evict_ratio_target,
 
             for (size_t i = 0;
                  i < metadata_shards_.size() && target_evict_num > 0; i++) {
-                auto& shard =
-                    metadata_shards_[(start_idx + i) % metadata_shards_.size()];
-                MutexLocker lock(&shard.mutex);
-                auto it = shard.metadata.begin();
-                while (it != shard.metadata.end() && target_evict_num > 0) {
+                MetadataShardAccessorRW shard(
+                    this, (start_idx + i) % metadata_shards_.size());
+                auto it = shard->metadata.begin();
+                while (it != shard->metadata.end() && target_evict_num > 0) {
                     auto& metadata = it->second;
-                    if (!metadata.IsLeaseExpired(now) || !metadata.HasSsdReplica() ||
-                        metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                                  ReplicaType::SSD_POOL) ||
-                        !CanEvictSsdReplicaSafely(metadata)) {
+                    if (!can_evict_ssd(metadata)) {
                         ++it;
                         continue;
                     }
@@ -3504,7 +3494,7 @@ void MasterService::BatchEvictSsd(double evict_ratio_target,
                                                     released_key_count,
                                                     released_bytes);
                         if (!metadata.IsValid()) {
-                            it = shard.metadata.erase(it);
+                            it = shard->metadata.erase(it);
                         } else {
                             ++it;
                         }
