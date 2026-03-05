@@ -40,6 +40,11 @@ DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
 DEFINE_double(eviction_high_watermark_ratio,
               mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
               "Ratio of high watermark trigger eviction");
+DEFINE_double(ssd_eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
+              "Ratio of SSD objects to evict when SSD pool usage is high");
+DEFINE_double(ssd_eviction_high_watermark_ratio,
+              mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
+              "SSD usage high watermark ratio that triggers SSD eviction");
 // RPC server configuration parameters (new, preferred)
 // TODO: deprecate port and max_threads in the future
 DEFINE_int32(rpc_thread_num, 0,
@@ -61,6 +66,22 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     }
     return true;
 });
+DEFINE_validator(ssd_eviction_ratio, [](const char* flagname, double value) {
+    if (value < 0.0 || value > 1.0) {
+        LOG(FATAL) << "SSD eviction ratio must be between 0.0 and 1.0";
+        return false;
+    }
+    return true;
+});
+DEFINE_validator(ssd_eviction_high_watermark_ratio,
+                 [](const char* flagname, double value) {
+                     if (value < 0.0 || value > 1.0) {
+                         LOG(FATAL) << "SSD eviction high watermark ratio must "
+                                       "be between 0.0 and 1.0";
+                         return false;
+                     }
+                     return true;
+                 });
 DEFINE_bool(enable_ha, false,
             "Enable high availability, which depends on etcd");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
@@ -182,6 +203,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("eviction_high_watermark_ratio",
                              &master_config.eviction_high_watermark_ratio,
                              FLAGS_eviction_high_watermark_ratio);
+    default_config.GetDouble("ssd_eviction_ratio",
+                             &master_config.ssd_eviction_ratio,
+                             FLAGS_ssd_eviction_ratio);
+    default_config.GetDouble("ssd_eviction_high_watermark_ratio",
+                             &master_config.ssd_eviction_high_watermark_ratio,
+                             FLAGS_ssd_eviction_high_watermark_ratio);
     default_config.GetInt64("client_live_ttl_sec",
                             &master_config.client_live_ttl_sec,
                             FLAGS_client_ttl);
@@ -381,6 +408,18 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.eviction_high_watermark_ratio =
             FLAGS_eviction_high_watermark_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("ssd_eviction_ratio", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ssd_eviction_ratio = FLAGS_ssd_eviction_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("ssd_eviction_high_watermark_ratio",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ssd_eviction_high_watermark_ratio =
+            FLAGS_ssd_eviction_high_watermark_ratio;
     }
     if ((google::GetCommandLineFlagInfo("enable_ha", &info) &&
          !info.is_default) ||
@@ -611,65 +650,73 @@ int main(int argc, char* argv[]) {
     if (value && std::string_view(value) == "rdma") {
         protocol = "rdma";
     }
-    LOG(INFO)
-        << "Master service started on port " << master_config.rpc_port
-        << ", max_threads=" << master_config.rpc_thread_num
-        << ", enable_metric_reporting=" << master_config.enable_metric_reporting
-        << ", metrics_port=" << master_config.metrics_port
-        << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
-        << ", default_kv_soft_pin_ttl=" << master_config.default_kv_soft_pin_ttl
-        << ", allow_evict_soft_pinned_objects="
-        << master_config.allow_evict_soft_pinned_objects
-        << ", eviction_ratio=" << master_config.eviction_ratio
-        << ", eviction_high_watermark_ratio="
-        << master_config.eviction_high_watermark_ratio
-        << ", enable_ha=" << master_config.enable_ha
-        << ", enable_offload=" << master_config.enable_offload
-        << ", etcd_endpoints=" << master_config.etcd_endpoints
-        << ", client_ttl=" << master_config.client_live_ttl_sec
-        << ", rpc_thread_num=" << master_config.rpc_thread_num
-        << ", rpc_port=" << master_config.rpc_port
-        << ", rpc_address=" << master_config.rpc_address
-        << ", rpc_conn_timeout_seconds="
-        << master_config.rpc_conn_timeout_seconds
-        << ", rpc_enable_tcp_no_delay=" << master_config.rpc_enable_tcp_no_delay
-        << ", rpc protocol=" << protocol
-        << ", cluster_id=" << master_config.cluster_id
-        << ", root_fs_dir=" << master_config.root_fs_dir
-        << ", global_file_segment_size="
-        << master_config.global_file_segment_size
-        << ", memory_allocator=" << master_config.memory_allocator
-        << ", enable_http_metadata_server="
-        << master_config.enable_http_metadata_server
-        << ", http_metadata_server_port="
-        << master_config.http_metadata_server_port
-        << ", http_metadata_server_host="
-        << master_config.http_metadata_server_host
-        << ", put_start_discard_timeout_sec="
-        << master_config.put_start_discard_timeout_sec
-        << ", put_start_release_timeout_sec="
-        << master_config.put_start_release_timeout_sec
-        << ", max_total_finished_tasks="
-        << master_config.max_total_finished_tasks
-        << ", max_total_pending_tasks=" << master_config.max_total_pending_tasks
-        << ", max_total_processing_tasks="
-        << master_config.max_total_processing_tasks
-        << ", pending_task_timeout_sec="
-        << master_config.pending_task_timeout_sec
-        << ", processing_task_timeout_sec="
-        << master_config.processing_task_timeout_sec
-        << ", enable_snapshot=" << master_config.enable_snapshot
-        << ", enable_snapshot_restore=" << master_config.enable_snapshot_restore
-        << ", snapshot_interval_seconds="
-        << master_config.snapshot_interval_seconds
-        << ", snapshot_backup_dir=" << master_config.snapshot_backup_dir
-        << ", snapshot_backend_type=" << master_config.snapshot_backend_type
-        << ", snapshot_retention_count="
-        << master_config.snapshot_retention_count
-        << ", max_retry_attempts=" << master_config.max_retry_attempts
-        << ", enable_cxl=" << master_config.enable_cxl
-        << ", cxl_path=" << master_config.cxl_path
-        << ", cxl_size=" << master_config.cxl_size;
+    LOG(INFO) << "Master service started on port " << master_config.rpc_port
+              << ", max_threads=" << master_config.rpc_thread_num
+              << ", enable_metric_reporting="
+              << master_config.enable_metric_reporting
+              << ", metrics_port=" << master_config.metrics_port
+              << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
+              << ", default_kv_soft_pin_ttl="
+              << master_config.default_kv_soft_pin_ttl
+              << ", allow_evict_soft_pinned_objects="
+              << master_config.allow_evict_soft_pinned_objects
+              << ", eviction_ratio=" << master_config.eviction_ratio
+              << ", eviction_high_watermark_ratio="
+              << master_config.eviction_high_watermark_ratio
+              << ", ssd_eviction_ratio=" << master_config.ssd_eviction_ratio
+              << ", ssd_eviction_high_watermark_ratio="
+              << master_config.ssd_eviction_high_watermark_ratio
+              << ", enable_ha=" << master_config.enable_ha
+              << ", enable_offload=" << master_config.enable_offload
+              << ", etcd_endpoints=" << master_config.etcd_endpoints
+              << ", client_ttl=" << master_config.client_live_ttl_sec
+              << ", rpc_thread_num=" << master_config.rpc_thread_num
+              << ", rpc_port=" << master_config.rpc_port
+              << ", rpc_address=" << master_config.rpc_address
+              << ", rpc_conn_timeout_seconds="
+              << master_config.rpc_conn_timeout_seconds
+              << ", rpc_enable_tcp_no_delay="
+              << master_config.rpc_enable_tcp_no_delay
+              << ", rpc protocol=" << protocol
+              << ", cluster_id=" << master_config.cluster_id
+              << ", root_fs_dir=" << master_config.root_fs_dir
+              << ", global_file_segment_size="
+              << master_config.global_file_segment_size
+              << ", memory_allocator=" << master_config.memory_allocator
+              << ", enable_http_metadata_server="
+              << master_config.enable_http_metadata_server
+              << ", http_metadata_server_port="
+              << master_config.http_metadata_server_port
+              << ", http_metadata_server_host="
+              << master_config.http_metadata_server_host
+              << ", put_start_discard_timeout_sec="
+              << master_config.put_start_discard_timeout_sec
+              << ", put_start_release_timeout_sec="
+              << master_config.put_start_release_timeout_sec
+              << ", max_total_finished_tasks="
+              << master_config.max_total_finished_tasks
+              << ", max_total_pending_tasks="
+              << master_config.max_total_pending_tasks
+              << ", max_total_processing_tasks="
+              << master_config.max_total_processing_tasks
+              << ", pending_task_timeout_sec="
+              << master_config.pending_task_timeout_sec
+              << ", processing_task_timeout_sec="
+              << master_config.processing_task_timeout_sec
+              << ", enable_snapshot=" << master_config.enable_snapshot
+              << ", enable_snapshot_restore="
+              << master_config.enable_snapshot_restore
+              << ", snapshot_interval_seconds="
+              << master_config.snapshot_interval_seconds
+              << ", snapshot_backup_dir=" << master_config.snapshot_backup_dir
+              << ", snapshot_backend_type="
+              << master_config.snapshot_backend_type
+              << ", snapshot_retention_count="
+              << master_config.snapshot_retention_count
+              << ", max_retry_attempts=" << master_config.max_retry_attempts
+              << ", enable_cxl=" << master_config.enable_cxl
+              << ", cxl_path=" << master_config.cxl_path
+              << ", cxl_size=" << master_config.cxl_size;
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;

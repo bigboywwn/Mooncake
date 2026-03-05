@@ -1,7 +1,10 @@
 #include "master_service.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <shared_mutex>
 #include <regex>
 #include <unordered_set>
@@ -23,6 +26,8 @@
 
 namespace mooncake {
 
+namespace {
+
 // Snapshot file names
 static const std::string SNAPSHOT_METADATA_FILE = "metadata";
 static const std::string SNAPSHOT_SEGMENTS_FILE = "segments";
@@ -37,6 +42,70 @@ static const std::string SNAPSHOT_BACKUP_RESTORE_DIR =
 static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
 static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
 
+int ReplicaReadPriority(const Replica::Descriptor& desc) {
+    if (desc.is_memory_replica()) {
+        return 0;
+    }
+    if (desc.is_ssd_pool_replica()) {
+        return 1;
+    }
+    if (desc.is_local_disk_replica()) {
+        return 2;
+    }
+    return 3;
+}
+
+bool ParseBoolEnv(const char* value, bool default_value) {
+    if (value == nullptr) {
+        return default_value;
+    }
+    std::string v(value);
+    std::transform(v.begin(), v.end(), v.begin(),
+                   [](unsigned char ch) { return std::tolower(ch); });
+    if (v == "1" || v == "true" || v == "yes" || v == "on") {
+        return true;
+    }
+    if (v == "0" || v == "false" || v == "no" || v == "off") {
+        return false;
+    }
+    return default_value;
+}
+
+int32_t ParseReactorCores() {
+    const char* v = std::getenv("MC_SPDK_REACTOR_CORES");
+    if (v == nullptr) {
+        return 1;
+    }
+    try {
+        int32_t cores = std::stoi(v);
+        return std::max(1, std::min(6, cores));
+    } catch (...) {
+        return 1;
+    }
+}
+
+uint32_t ParseUint32Env(const char* key, uint32_t default_value) {
+    const char* v = std::getenv(key);
+    if (v == nullptr) {
+        return default_value;
+    }
+    try {
+        return static_cast<uint32_t>(std::stoul(v));
+    } catch (...) {
+        return default_value;
+    }
+}
+
+uint64_t ReplicaSsdBytes(const Replica& replica) {
+    if (!replica.is_ssd_pool_replica()) {
+        return 0;
+    }
+    const auto desc = replica.get_descriptor().get_ssd_extent_descriptor();
+    return static_cast<uint64_t>(desc.block_size) * desc.lba_count;
+}
+
+}  // namespace
+
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
@@ -45,6 +114,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
+      ssd_eviction_ratio_(config.ssd_eviction_ratio),
+      ssd_eviction_high_watermark_ratio_(
+          config.ssd_eviction_high_watermark_ratio),
       client_live_ttl_sec_(config.client_live_ttl_sec),
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
@@ -103,6 +175,19 @@ MasterService::MasterService(const MasterServiceConfig& config)
             << "current value: " << eviction_high_watermark_ratio_;
         throw std::invalid_argument("Invalid eviction high watermark ratio");
     }
+    if (ssd_eviction_ratio_ < 0.0 || ssd_eviction_ratio_ > 1.0) {
+        LOG(ERROR) << "SSD eviction ratio must be between 0.0 and 1.0, "
+                   << "current value: " << ssd_eviction_ratio_;
+        throw std::invalid_argument("Invalid SSD eviction ratio");
+    }
+    if (ssd_eviction_high_watermark_ratio_ < 0.0 ||
+        ssd_eviction_high_watermark_ratio_ > 1.0) {
+        LOG(ERROR)
+            << "SSD eviction high watermark ratio must be between 0.0 and 1.0, "
+            << "current value: " << ssd_eviction_high_watermark_ratio_;
+        throw std::invalid_argument(
+            "Invalid SSD eviction high watermark ratio");
+    }
 
     if (put_start_release_timeout_sec_ <= put_start_discard_timeout_sec_) {
         LOG(ERROR) << "put_start_release_timeout="
@@ -129,6 +214,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
     task_cleanup_thread_ =
         std::thread(&MasterService::TaskCleanupThreadFunc, this);
     VLOG(1) << "action=start_task_cleanup_thread";
+    ddr_pool_enabled_ =
+        ParseBoolEnv(std::getenv("MC_DDR_POOL_ENABLED"), true);
 
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
@@ -512,10 +599,16 @@ auto MasterService::BatchReplicaClear(
                 &Replica::fn_is_completed, [](Replica& replica) {
                     if (replica.is_memory_replica()) {
                         MasterMetricManager::instance().dec_mem_cache_nums();
-                    } else if (replica.is_disk_replica()) {
+                    } else if (replica.is_ssd_pool_replica() ||
+                               replica.is_disk_replica()) {
                         MasterMetricManager::instance().dec_file_cache_nums();
                     }
                 });
+
+            int64_t released_key_count = 0;
+            int64_t released_bytes = 0;
+            ReleaseSsdReplicasForObject(metadata, key, "batch_replica_clear_all",
+                                        released_key_count, released_bytes);
 
             // Erase the entire metadata (all replicas will be deallocated)
             accessor.Erase();
@@ -526,6 +619,7 @@ auto MasterService::BatchReplicaClear(
         } else {
             // Clear only replicas on the specified segment_name
             bool has_replica_on_segment = false;
+            std::vector<std::string> ssd_extent_ids_to_release;
             const auto match_replica_on_segment =
                 [&](const Replica& replica) -> bool {
                 if (!replica.is_completed()) {
@@ -548,6 +642,12 @@ auto MasterService::BatchReplicaClear(
                         MasterMetricManager::instance().dec_mem_cache_nums();
                     } else if (replica.is_disk_replica()) {
                         MasterMetricManager::instance().dec_file_cache_nums();
+                    } else if (replica.is_ssd_pool_replica()) {
+                        MasterMetricManager::instance().dec_file_cache_nums();
+                        const auto ssd_desc =
+                            replica.get_descriptor().get_ssd_extent_descriptor();
+                        ssd_extent_ids_to_release.emplace_back(
+                            ssd_desc.extent_id);
                     }
                 });
 
@@ -560,6 +660,12 @@ auto MasterService::BatchReplicaClear(
             }
 
             metadata.EraseReplicas(match_replica_on_segment);
+            for (const auto& extent_id : ssd_extent_ids_to_release) {
+                if (!ssd_pool_manager_.ReleaseExtent(
+                        extent_id, "batch_replica_clear_segment")) {
+                    MasterMetricManager::instance().inc_ssd_extent_release_fail();
+                }
+            }
 
             // If no valid replicas remain, erase the entire metadata
             if (!metadata.IsValid()) {
@@ -612,6 +718,13 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
                     continue;
                 }
 
+                std::stable_sort(replica_list.begin(), replica_list.end(),
+                                 [](const Replica::Descriptor& a,
+                                    const Replica::Descriptor& b) {
+                                     return ReplicaReadPriority(a) <
+                                            ReplicaReadPriority(b);
+                                 });
+
                 results.emplace(key, std::move(replica_list));
                 metadata.GrantLease(default_kv_lease_ttl_,
                                     default_kv_soft_pin_ttl_);
@@ -646,9 +759,16 @@ auto MasterService::GetReplicaList(const std::string& key)
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
+    std::stable_sort(replica_list.begin(), replica_list.end(),
+                     [](const Replica::Descriptor& a,
+                        const Replica::Descriptor& b) {
+                         return ReplicaReadPriority(a) < ReplicaReadPriority(b);
+                     });
+
     if (replica_list[0].is_memory_replica()) {
         MasterMetricManager::instance().inc_mem_cache_hit_nums();
-    } else if (replica_list[0].is_disk_replica()) {
+    } else if (replica_list[0].is_ssd_pool_replica() ||
+               replica_list[0].is_disk_replica()) {
         MasterMetricManager::instance().inc_file_cache_hit_nums();
     }
     MasterMetricManager::instance().inc_valid_get_nums();
@@ -701,6 +821,18 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             metadata.put_start_time + put_start_discard_timeout_sec_ < now) {
             auto replicas = metadata.PopReplicas(&Replica::fn_is_processing);
             if (!replicas.empty()) {
+                for (const auto& replica : replicas) {
+                    if (!replica.is_ssd_pool_replica()) {
+                        continue;
+                    }
+                    const auto ssd_desc =
+                        replica.get_descriptor().get_ssd_extent_descriptor();
+                    if (!ssd_pool_manager_.ReleaseExtent(
+                            ssd_desc.extent_id, "putstart_timeout_discard")) {
+                        MasterMetricManager::instance()
+                            .inc_ssd_extent_release_fail();
+                    }
+                }
                 std::lock_guard lock(discarded_replicas_mutex_);
                 discarded_replicas_.emplace_back(
                     std::move(replicas),
@@ -714,9 +846,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         }
     }
 
-    // Allocate replicas
     std::vector<Replica> replicas;
-    {
+    if (ddr_pool_enabled_) {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
         const auto& allocator_manager = allocator_access.getAllocatorManager();
@@ -752,6 +883,22 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
         replicas.emplace_back(file_path, total_length,
                               ReplicaStatus::PROCESSING);
+    }
+
+    if (ssd_pool_manager_.enabled()) {
+        auto ssd_extent = AllocateSsdExtent(key, total_length);
+        if (ssd_extent.has_value()) {
+            replicas.emplace_back(std::move(ssd_extent.value()),
+                                  ReplicaStatus::PROCESSING);
+        } else {
+            VLOG(1) << "SSD extent allocation skipped for key=" << key
+                    << " (DDR path remains accepted), error="
+                    << toString(ssd_extent.error());
+        }
+    }
+
+    if (replicas.empty()) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
     std::vector<Replica::Descriptor> replica_list;
@@ -793,14 +940,12 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         [replica_type](const Replica& replica) {
             return replica.type() == replica_type;
         },
-        [](Replica& replica) { replica.mark_complete(); });
-
-    if (enable_offload_) {
-        metadata.VisitReplicas(&Replica::fn_is_completed,
-                               [this, &key](const Replica& replica) {
-                                   PushOffloadingQueue(key, replica);
-                               });
-    }
+        [this, &key, replica_type](Replica& replica) {
+            replica.mark_complete();
+            if (enable_offload_ && replica_type == ReplicaType::MEMORY) {
+                PushOffloadingQueue(key, replica);
+            }
+        });
 
     // If the object is completed, remove it from the processing set.
     if (metadata.AllReplicas(&Replica::fn_is_completed) &&
@@ -810,7 +955,8 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 
     if (replica_type == ReplicaType::MEMORY) {
         MasterMetricManager::instance().inc_mem_cache_nums();
-    } else if (replica_type == ReplicaType::DISK) {
+    } else if (replica_type == ReplicaType::SSD_POOL ||
+               replica_type == ReplicaType::DISK) {
         MasterMetricManager::instance().inc_file_cache_nums();
     }
     // 1. Set lease timeout to now, indicating that the object has no lease
@@ -837,7 +983,6 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                    << ". Expected ReplicaType::LOCAL_DISK.";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-
     if (!metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
@@ -865,6 +1010,83 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     return {};
 }
 
+bool MasterService::CanEvictSsdReplicaSafely(
+    const ObjectMetadata& metadata) const {
+    if (!metadata.HasSsdReplica()) {
+        return false;
+    }
+    return metadata.HasCompleteReplicaExcluding(ReplicaType::SSD_POOL);
+}
+
+bool MasterService::ReleaseSsdReplicasForObject(ObjectMetadata& metadata,
+                                                const std::string& key,
+                                                const std::string& reason,
+                                                int64_t& released_key_count,
+                                                int64_t& released_bytes) {
+    std::vector<std::pair<std::string, uint64_t>> extents_to_release;
+    metadata.VisitReplicas(
+        &Replica::fn_is_ssd_pool_replica, [&](const Replica& replica) {
+            const auto desc = replica.get_descriptor().get_ssd_extent_descriptor();
+            extents_to_release.emplace_back(desc.extent_id,
+                                            ReplicaSsdBytes(replica));
+        });
+
+    if (extents_to_release.empty()) {
+        return false;
+    }
+
+    metadata.EraseReplica(ReplicaType::SSD_POOL);
+    released_key_count += 1;
+    for (const auto& [extent_id, bytes] : extents_to_release) {
+        released_bytes += static_cast<int64_t>(bytes);
+        if (!ssd_pool_manager_.ReleaseExtent(extent_id, reason)) {
+            MasterMetricManager::instance().inc_ssd_extent_release_fail();
+            LOG(WARNING) << "release_ssd_extent_failed key=" << key
+                         << ", extent_id=" << extent_id
+                         << ", reason=" << reason;
+        }
+    }
+    return true;
+}
+
+tl::expected<SsdExtentDescriptor, ErrorCode> MasterService::AllocateSsdExtent(
+    const std::string& key, uint64_t object_size, const std::string& policy) {
+    if (!ssd_pool_manager_.enabled()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (policy != "consistent_hash") {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto extent = ssd_pool_manager_.AllocateExtent(key, object_size);
+    if (!extent.has_value()) {
+        ssd_need_eviction_ = true;
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    return std::move(*extent);
+}
+
+tl::expected<void, ErrorCode> MasterService::ReportSsdWriteResult(
+    const UUID& client_id, const std::string& key, const std::string& extent_id,
+    bool success) {
+    if (!extent_id.empty()) {
+        ssd_pool_manager_.ReportExtentIoResult(extent_id, success);
+    }
+
+    if (success) {
+        return PutEnd(client_id, key, ReplicaType::SSD_POOL);
+    }
+    auto revoke = PutRevoke(client_id, key, ReplicaType::SSD_POOL);
+    if (!revoke.has_value() && revoke.error() != ErrorCode::OBJECT_NOT_FOUND) {
+        LOG(WARNING) << "ssd_write_failed_revoke_failed key=" << key
+                     << ", extent_id=" << extent_id
+                     << ", error=" << toString(revoke.error());
+        return tl::make_unexpected(revoke.error());
+    }
+    VLOG(1) << "ssd_write_failed_revoke_done key=" << key
+            << ", extent_id=" << extent_id;
+    return {};
+}
+
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
@@ -882,25 +1104,45 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    auto processing_rep =
-        metadata.GetFirstReplica([replica_type](const Replica& replica) {
-            return replica.type() == replica_type && !replica.is_processing();
+    int64_t complete_replica_count = 0;
+    bool has_invalid_status = false;
+    ReplicaStatus invalid_status = ReplicaStatus::PROCESSING;
+    metadata.VisitReplicas(
+        [replica_type](const Replica& replica) {
+            return replica.type() == replica_type;
+        },
+        [&](const Replica& replica) {
+            if (replica.status() == ReplicaStatus::COMPLETE) {
+                complete_replica_count++;
+                return;
+            }
+            if (replica.status() != ReplicaStatus::PROCESSING) {
+                has_invalid_status = true;
+                invalid_status = replica.status();
+            }
         });
-    if (processing_rep != nullptr) {
-        LOG(ERROR) << "key=" << key << ", status=" << processing_rep->status()
+    if (has_invalid_status) {
+        LOG(ERROR) << "key=" << key << ", status=" << invalid_status
                    << ", error=invalid_replica_status";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
     if (replica_type == ReplicaType::MEMORY) {
-        MasterMetricManager::instance().dec_mem_cache_nums();
-    } else if (replica_type == ReplicaType::DISK) {
-        MasterMetricManager::instance().dec_file_cache_nums();
+        MasterMetricManager::instance().dec_mem_cache_nums(complete_replica_count);
+    } else if (replica_type == ReplicaType::SSD_POOL ||
+               replica_type == ReplicaType::DISK) {
+        MasterMetricManager::instance().dec_file_cache_nums(
+            complete_replica_count);
     }
 
-    metadata.EraseReplicas([replica_type](const Replica& replica) {
-        return replica.type() == replica_type;
-    });
+    if (replica_type == ReplicaType::SSD_POOL) {
+        int64_t released_key_count = 0;
+        int64_t released_bytes = 0;
+        ReleaseSsdReplicasForObject(metadata, key, "put_revoke",
+                                    released_key_count, released_bytes);
+    } else {
+        metadata.EraseReplica(replica_type);
+    }
 
     // If the object is completed, remove it from the processing set.
     if (metadata.AllReplicas(&Replica::fn_is_completed) &&
@@ -1418,6 +1660,10 @@ auto MasterService::Remove(const std::string& key, bool force)
         LOG(ERROR) << "key=" << key << ", error=object_has_replication_task";
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
+    int64_t released_key_count = 0;
+    int64_t released_bytes = 0;
+    ReleaseSsdReplicasForObject(metadata, key, "remove", released_key_count,
+                                released_bytes);
 
     // Remove object metadata
     accessor.Erase();
@@ -1474,6 +1720,11 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
+                int64_t released_key_count = 0;
+                int64_t released_bytes = 0;
+                ReleaseSsdReplicasForObject(it->second, it->first,
+                                            "remove_by_regex",
+                                            released_key_count, released_bytes);
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
@@ -1516,6 +1767,10 @@ long MasterService::RemoveAll(bool force) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
+                int64_t released_key_count = 0;
+                int64_t released_bytes = 0;
+                ReleaseSsdReplicasForObject(it->second, it->first, "remove_all",
+                                            released_key_count, released_bytes);
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
@@ -1590,6 +1845,34 @@ MasterService::GetStorageConfig() const {
     }
     std::string fsdir = root_fs_dir_ + "/" + cluster_id_;
     return GetStorageConfigResponse(fsdir, enable_disk_eviction_, quota_bytes_);
+}
+
+tl::expected<GetTieredStorageConfigResponse, ErrorCode>
+MasterService::GetTieredStorageConfig() const {
+    std::vector<std::string> enabled_tiers;
+    if (ddr_pool_enabled_) {
+        enabled_tiers.emplace_back("DDR");
+    }
+    if (ssd_pool_manager_.enabled()) {
+        enabled_tiers.emplace_back("SSD");
+    }
+    if (use_disk_replica_) {
+        enabled_tiers.emplace_back("remoteFS");
+    }
+
+    const char* impl_env = std::getenv("MC_NVMEOF_CLIENT_IMPL");
+    std::string impl = impl_env == nullptr ? "spdk" : std::string(impl_env);
+    std::transform(impl.begin(), impl.end(), impl.begin(),
+                   [](unsigned char ch) { return std::tolower(ch); });
+    if (impl != "spdk" && impl != "legacy") {
+        impl = "spdk";
+    }
+
+    return GetTieredStorageConfigResponse(
+        std::move(enabled_tiers), impl, ParseReactorCores(),
+        ParseUint32Env("MC_SSD_QUEUE_LIMIT", 1024),
+        ParseUint32Env("MC_SSD_IO_TIMEOUT_MS", 5000),
+        ParseBoolEnv(std::getenv("MC_SSD_AUTO_FALLBACK_ENABLED"), false));
 }
 
 auto MasterService::MountLocalDiskSegment(const UUID& client_id,
@@ -1734,6 +2017,24 @@ void MasterService::EvictionThreadFunc() {
             last_discard_time = now;
         }
 
+        if (ssd_pool_manager_.enabled()) {
+            const double ssd_used_ratio = ssd_pool_manager_.GetUsedRatio();
+            if (ssd_used_ratio > ssd_eviction_high_watermark_ratio_ ||
+                (ssd_need_eviction_ && ssd_eviction_ratio_ > 0.0)) {
+                const double ssd_evict_ratio_target =
+                    std::max(ssd_eviction_ratio_,
+                             ssd_used_ratio -
+                                 ssd_eviction_high_watermark_ratio_ +
+                                 ssd_eviction_ratio_);
+                const double ssd_evict_ratio_lowerbound =
+                    std::max(ssd_evict_ratio_target * 0.5,
+                             ssd_used_ratio -
+                                 ssd_eviction_high_watermark_ratio_);
+                BatchEvictSsd(ssd_evict_ratio_target,
+                              ssd_evict_ratio_lowerbound);
+            }
+        }
+
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kEvictionThreadSleepMs));
     }
@@ -1781,6 +2082,18 @@ void MasterService::DiscardExpiredProcessingReplicas(
         if (ttl < now) {
             auto replicas = metadata.PopReplicas(&Replica::fn_is_processing);
             if (!replicas.empty()) {
+                for (const auto& replica : replicas) {
+                    if (!replica.is_ssd_pool_replica()) {
+                        continue;
+                    }
+                    const auto ssd_desc =
+                        replica.get_descriptor().get_ssd_extent_descriptor();
+                    if (!ssd_pool_manager_.ReleaseExtent(
+                            ssd_desc.extent_id, "processing_timeout_discard")) {
+                        MasterMetricManager::instance()
+                            .inc_ssd_extent_release_fail();
+                    }
+                }
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
 
@@ -3019,6 +3332,216 @@ void MasterService::BatchEvict(double evict_ratio_target,
             << ", total_freed_size=" << total_freed_size;
 }
 
+void MasterService::BatchEvictSsd(double evict_ratio_target,
+                                  double evict_ratio_lowerbound) {
+    if (!ssd_pool_manager_.enabled()) {
+        return;
+    }
+    if (evict_ratio_target < evict_ratio_lowerbound) {
+        LOG(ERROR) << "ssd_evict_ratio_target=" << evict_ratio_target
+                   << ", ssd_evict_ratio_lowerbound=" << evict_ratio_lowerbound
+                   << ", error=invalid_params";
+        evict_ratio_lowerbound = evict_ratio_target;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    long evicted_count = 0;
+    long object_count = 0;
+    int64_t total_freed_size = 0;
+    std::vector<std::chrono::steady_clock::time_point> no_pin_objects;
+    std::vector<std::chrono::steady_clock::time_point> soft_pin_objects;
+
+    size_t start_idx = rand() % metadata_shards_.size();
+
+    // First pass: only non-soft-pinned objects.
+    for (size_t i = 0; i < metadata_shards_.size(); i++) {
+        auto& shard = metadata_shards_[(start_idx + i) % metadata_shards_.size()];
+        MutexLocker lock(&shard.mutex);
+
+        std::vector<std::chrono::steady_clock::time_point> candidates;
+        long shard_evictable_count = 0;
+        for (auto it = shard.metadata.begin(); it != shard.metadata.end(); ++it) {
+            auto& metadata = it->second;
+            if (!metadata.IsLeaseExpired(now) || !metadata.HasSsdReplica() ||
+                metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                          ReplicaType::SSD_POOL) ||
+                !CanEvictSsdReplicaSafely(metadata)) {
+                continue;
+            }
+
+            shard_evictable_count++;
+            if (!metadata.IsSoftPinned(now)) {
+                candidates.push_back(metadata.lease_timeout);
+            } else if (allow_evict_soft_pinned_objects_) {
+                soft_pin_objects.push_back(metadata.lease_timeout);
+            }
+        }
+        object_count += shard_evictable_count;
+        const long ideal_evict_num =
+            std::ceil(object_count * evict_ratio_target) - evicted_count;
+
+        if (ideal_evict_num > 0 && !candidates.empty()) {
+            long evict_num = std::min(ideal_evict_num, (long)candidates.size());
+            long shard_evicted_count = 0;
+            std::nth_element(candidates.begin(),
+                             candidates.begin() + (evict_num - 1),
+                             candidates.end());
+            auto target_timeout = candidates[evict_num - 1];
+
+            auto it = shard.metadata.begin();
+            while (it != shard.metadata.end()) {
+                auto& metadata = it->second;
+                if (!metadata.IsLeaseExpired(now) || metadata.IsSoftPinned(now) ||
+                    !metadata.HasSsdReplica() ||
+                    metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                              ReplicaType::SSD_POOL) ||
+                    !CanEvictSsdReplicaSafely(metadata)) {
+                    ++it;
+                    continue;
+                }
+
+                if (metadata.lease_timeout <= target_timeout) {
+                    int64_t released_key_count = 0;
+                    int64_t released_bytes = 0;
+                    ReleaseSsdReplicasForObject(metadata, it->first, "evict",
+                                                released_key_count,
+                                                released_bytes);
+                    if (!metadata.IsValid()) {
+                        it = shard.metadata.erase(it);
+                    } else {
+                        ++it;
+                    }
+                    shard_evicted_count += released_key_count;
+                    total_freed_size += released_bytes;
+                } else {
+                    no_pin_objects.push_back(metadata.lease_timeout);
+                    ++it;
+                }
+            }
+            evicted_count += shard_evicted_count;
+        } else {
+            no_pin_objects.insert(no_pin_objects.end(), candidates.begin(),
+                                  candidates.end());
+        }
+    }
+
+    long target_evict_num =
+        std::ceil(object_count * evict_ratio_lowerbound) - evicted_count;
+    target_evict_num =
+        std::min(target_evict_num,
+                 (long)no_pin_objects.size() + (long)soft_pin_objects.size());
+
+    if (target_evict_num > 0) {
+        if (target_evict_num <= static_cast<long>(no_pin_objects.size())) {
+            std::nth_element(no_pin_objects.begin(),
+                             no_pin_objects.begin() + (target_evict_num - 1),
+                             no_pin_objects.end());
+            auto target_timeout = no_pin_objects[target_evict_num - 1];
+
+            for (size_t i = 0;
+                 i < metadata_shards_.size() && target_evict_num > 0; i++) {
+                auto& shard =
+                    metadata_shards_[(start_idx + i) % metadata_shards_.size()];
+                MutexLocker lock(&shard.mutex);
+                auto it = shard.metadata.begin();
+                while (it != shard.metadata.end() && target_evict_num > 0) {
+                    auto& metadata = it->second;
+                    if (metadata.lease_timeout <= target_timeout &&
+                        metadata.IsLeaseExpired(now) &&
+                        !metadata.IsSoftPinned(now) &&
+                        metadata.HasSsdReplica() &&
+                        !metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                                   ReplicaType::SSD_POOL) &&
+                        CanEvictSsdReplicaSafely(metadata)) {
+                        int64_t released_key_count = 0;
+                        int64_t released_bytes = 0;
+                        ReleaseSsdReplicasForObject(metadata, it->first, "evict",
+                                                    released_key_count,
+                                                    released_bytes);
+                        if (!metadata.IsValid()) {
+                            it = shard.metadata.erase(it);
+                        } else {
+                            ++it;
+                        }
+                        evicted_count += released_key_count;
+                        total_freed_size += released_bytes;
+                        target_evict_num -= released_key_count;
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+        } else if (!soft_pin_objects.empty()) {
+            const long soft_pin_evict_num =
+                target_evict_num - static_cast<long>(no_pin_objects.size());
+            std::nth_element(
+                soft_pin_objects.begin(),
+                soft_pin_objects.begin() + (soft_pin_evict_num - 1),
+                soft_pin_objects.end());
+            auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
+
+            for (size_t i = 0;
+                 i < metadata_shards_.size() && target_evict_num > 0; i++) {
+                auto& shard =
+                    metadata_shards_[(start_idx + i) % metadata_shards_.size()];
+                MutexLocker lock(&shard.mutex);
+                auto it = shard.metadata.begin();
+                while (it != shard.metadata.end() && target_evict_num > 0) {
+                    auto& metadata = it->second;
+                    if (!metadata.IsLeaseExpired(now) || !metadata.HasSsdReplica() ||
+                        metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                                  ReplicaType::SSD_POOL) ||
+                        !CanEvictSsdReplicaSafely(metadata)) {
+                        ++it;
+                        continue;
+                    }
+
+                    if (!metadata.IsSoftPinned(now) ||
+                        metadata.lease_timeout <= soft_target_timeout) {
+                        int64_t released_key_count = 0;
+                        int64_t released_bytes = 0;
+                        ReleaseSsdReplicasForObject(metadata, it->first, "evict",
+                                                    released_key_count,
+                                                    released_bytes);
+                        if (!metadata.IsValid()) {
+                            it = shard.metadata.erase(it);
+                        } else {
+                            ++it;
+                        }
+                        evicted_count += released_key_count;
+                        total_freed_size += released_bytes;
+                        target_evict_num -= released_key_count;
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+        } else {
+            LOG(ERROR) << "Error in second pass SSD eviction: target_evict_num="
+                       << target_evict_num
+                       << ", no_pin_objects.size()=" << no_pin_objects.size()
+                       << ", soft_pin_objects.size()="
+                       << soft_pin_objects.size();
+        }
+    }
+
+    if (evicted_count > 0) {
+        ssd_need_eviction_ = false;
+        MasterMetricManager::instance().inc_ssd_eviction_success(
+            evicted_count, total_freed_size);
+    } else {
+        if (object_count == 0) {
+            ssd_need_eviction_ = false;
+        }
+        MasterMetricManager::instance().inc_ssd_eviction_fail();
+    }
+
+    VLOG(1) << "action=evict_ssd_objects"
+            << ", evicted_count=" << evicted_count
+            << ", total_freed_size=" << total_freed_size
+            << ", object_count=" << object_count;
+}
+
 void MasterService::ClientMonitorFunc() {
     std::unordered_map<UUID, std::chrono::steady_clock::time_point,
                        boost::hash<UUID>>
@@ -3837,5 +4360,4 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
 
     return {};
 }
-
 }  // namespace mooncake

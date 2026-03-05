@@ -911,6 +911,35 @@ WrappedMasterService::GetStorageConfig() {
     return result;
 }
 
+tl::expected<GetTieredStorageConfigResponse, ErrorCode>
+WrappedMasterService::GetTieredStorageConfig() {
+    ScopedVLogTimer timer(1, "GetTieredStorageConfig");
+    timer.LogRequest("action=get_tiered_storage_config");
+
+    auto result = master_service_.GetTieredStorageConfig();
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdWriteResult(
+    const UUID& client_id, const std::string& key,
+    const std::string& extent_id, bool success) {
+    return execute_rpc(
+        "ReportSsdWriteResult",
+        [&] {
+            return master_service_.ReportSsdWriteResult(client_id, key,
+                                                        extent_id, success);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", extent_id=", extent_id,
+                             ", success=", success);
+        },
+        [] { MasterMetricManager::instance().inc_put_end_requests(); },
+        [] { MasterMetricManager::instance().inc_put_end_failures(); });
+}
+
 tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
     const UUID& client_id) {
     ScopedVLogTimer timer(1, "Ping");
@@ -1010,6 +1039,12 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::GetFsdir>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetStorageConfig>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetTieredStorageConfig>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::ReportSsdWriteResult>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);

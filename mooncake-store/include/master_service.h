@@ -28,6 +28,7 @@
 #include "replica.h"
 #include "serialize/serializer_backend.h"
 #include "task_manager.h"
+#include "ssd_pool_manager.h"
 
 namespace mooncake {
 // Forward declarations
@@ -196,7 +197,7 @@ class MasterService {
 
     /**
      * @brief Complete a put operation, replica_type indicates the type of
-     * replica to complete (memory or disk)
+     * replica to complete (memory / ssd pool / disk)
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
@@ -208,6 +209,15 @@ class MasterService {
      */
     auto AddReplica(const UUID& client_id, const std::string& key,
                     Replica& replica) -> tl::expected<void, ErrorCode>;
+
+    tl::expected<SsdExtentDescriptor, ErrorCode> AllocateSsdExtent(
+        const std::string& key, uint64_t object_size,
+        const std::string& policy = "consistent_hash");
+
+    tl::expected<void, ErrorCode> ReportSsdWriteResult(const UUID& client_id,
+                                                       const std::string& key,
+                                                       const std::string& extent_id,
+                                                       bool success);
 
     /**
      * @brief Revoke a put operation, replica_type indicates the type of
@@ -350,6 +360,12 @@ class MasterService {
     tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig() const;
 
     /**
+     * @brief Get tiered storage control-plane configuration.
+     */
+    tl::expected<GetTieredStorageConfigResponse, ErrorCode>
+    GetTieredStorageConfig() const;
+
+    /**
      * @brief Mounts a file storage segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
@@ -437,6 +453,11 @@ class MasterService {
 
     void HandleChildTimeout(pid_t pid, const std::string& snapshot_id);
     void HandleChildExit(pid_t pid, int status, const std::string& snapshot_id);
+    struct ObjectMetadata;
+
+    // Resolve the key to a sanitized format for storage
+    std::string SanitizeKey(const std::string& key) const;
+    std::string ResolvePath(const std::string& key) const;
 
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
@@ -447,6 +468,15 @@ class MasterService {
     // evict_ratio_lowerbound, the second pass will be triggered and try to
     // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    void BatchEvictSsd(double evict_ratio_target, double evict_ratio_lowerbound);
+
+    bool ReleaseSsdReplicasForObject(ObjectMetadata& metadata,
+                                     const std::string& key,
+                                     const std::string& reason,
+                                     int64_t& released_key_count,
+                                     int64_t& released_bytes);
+
+    bool CanEvictSsdReplicaSafely(const ObjectMetadata& metadata) const;
 
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
@@ -648,6 +678,56 @@ class MasterService {
             }
         }
 
+        // Erase all replicas of the given type
+        void EraseReplica(ReplicaType replica_type) {
+            replicas_.erase(
+                std::remove_if(replicas_.begin(), replicas_.end(),
+                               [replica_type](const Replica& replica) {
+                                   return replica.type() == replica_type;
+                               }),
+                replicas_.end());
+        }
+
+        // Check if there is a memory replica
+        bool HasMemReplica() const {
+            return std::any_of(replicas_.begin(), replicas_.end(),
+                               [](const Replica& replica) {
+                                   return replica.type() == ReplicaType::MEMORY;
+                               });
+        }
+
+        // Get the count of memory replicas
+        int GetMemReplicaCount() const {
+            return std::count_if(
+                replicas_.begin(), replicas_.end(),
+                [](const Replica& replica) {
+                    return replica.type() == ReplicaType::MEMORY;
+                });
+        }
+
+        bool HasSsdReplica() const {
+            return std::any_of(replicas_.begin(), replicas_.end(),
+                               [](const Replica& replica) {
+                                   return replica.type() == ReplicaType::SSD_POOL;
+                               });
+        }
+
+        int GetSsdReplicaCount() const {
+            return std::count_if(
+                replicas_.begin(), replicas_.end(),
+                [](const Replica& replica) {
+                    return replica.type() == ReplicaType::SSD_POOL;
+                });
+        }
+
+        bool HasCompleteReplicaExcluding(ReplicaType excluded_type) const {
+            return std::any_of(replicas_.begin(), replicas_.end(),
+                               [excluded_type](const Replica& replica) {
+                                   return replica.type() != excluded_type &&
+                                          replica.status() ==
+                                              ReplicaStatus::COMPLETE;
+                               });
+        }
         // Check if the lease has expired
         bool IsLeaseExpired() const {
             SpinLocker locker(&lock);
@@ -795,6 +875,11 @@ class MasterService {
         false};  // Set to trigger eviction when not enough space left
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    std::atomic<bool> ssd_need_eviction_{
+        false};  // Set to trigger SSD eviction when SSD pool runs short
+    const double ssd_eviction_ratio_;  // in range [0.0, 1.0]
+    const double
+        ssd_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
     // Eviction thread related members
     std::thread eviction_thread_;
@@ -1020,7 +1105,9 @@ class MasterService {
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
 
+    bool ddr_pool_enabled_{true};
     bool use_disk_replica_{false};
+    SSDPoolManager ssd_pool_manager_;
 
     // Segment management
     SegmentManager segment_manager_;

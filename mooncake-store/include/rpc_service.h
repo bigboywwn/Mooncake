@@ -98,6 +98,13 @@ class WrappedMasterService {
 
     tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig();
 
+    tl::expected<GetTieredStorageConfigResponse, ErrorCode>
+    GetTieredStorageConfig();
+
+    tl::expected<void, ErrorCode> ReportSsdWriteResult(
+        const UUID& client_id, const std::string& key,
+        const std::string& extent_id, bool success);
+
     tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
 
     tl::expected<std::string, ErrorCode> ServiceReady();

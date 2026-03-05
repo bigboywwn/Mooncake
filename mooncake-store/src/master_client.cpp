@@ -138,6 +138,16 @@ struct RpcNameTraits<&WrappedMasterService::GetStorageConfig> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetTieredStorageConfig> {
+    static constexpr const char* value = "GetTieredStorageConfig";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::ReportSsdWriteResult> {
+    static constexpr const char* value = "ReportSsdWriteResult";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
     static constexpr const char* value = "ServiceReady";
 };
@@ -615,6 +625,29 @@ MasterClient::GetStorageConfig() {
 
     auto result = invoke_rpc<&WrappedMasterService::GetStorageConfig,
                              GetStorageConfigResponse>();
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<GetTieredStorageConfigResponse, ErrorCode>
+MasterClient::GetTieredStorageConfig() {
+    ScopedVLogTimer timer(1, "MasterClient::GetTieredStorageConfig");
+    timer.LogRequest("action=get_tiered_storage_config");
+
+    auto result = invoke_rpc<&WrappedMasterService::GetTieredStorageConfig,
+                             GetTieredStorageConfigResponse>();
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::ReportSsdWriteResult(
+    const std::string& key, const std::string& extent_id, bool success) {
+    ScopedVLogTimer timer(1, "MasterClient::ReportSsdWriteResult");
+    timer.LogRequest("key=", key, ", extent_id=", extent_id,
+                     ", success=", success);
+
+    auto result = invoke_rpc<&WrappedMasterService::ReportSsdWriteResult, void>(
+        client_id_, key, extent_id, success);
     timer.LogResponseExpected(result);
     return result;
 }

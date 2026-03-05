@@ -254,6 +254,18 @@ class MasterClient {
     [[nodiscard]] tl::expected<GetStorageConfigResponse, ErrorCode>
     GetStorageConfig();
 
+    [[nodiscard]] tl::expected<GetTieredStorageConfigResponse, ErrorCode>
+    GetTieredStorageConfig();
+
+    /**
+     * @brief Reports asynchronous SSD write result for one key.
+     * @param key Object key.
+     * @param extent_id SSD extent id allocated by PutStart.
+     * @param success true means SSD write completed; false means failed.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdWriteResult(
+        const std::string& key, const std::string& extent_id, bool success);
+
     /**
      * @brief Pings master to check its availability
      * @return tl::expected<PingResponse, ErrorCode>
