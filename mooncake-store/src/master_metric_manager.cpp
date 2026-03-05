@@ -240,6 +240,29 @@ MasterMetricManager::MasterMetricManager()
                          "Total number of keys evicted"),
       evicted_size_("master_evicted_size_bytes",
                     "Total bytes of evicted objects"),
+      ssd_eviction_success_("master_ssd_eviction_success",
+                            "Total number of successful SSD eviction "
+                            "operations"),
+      ssd_eviction_attempts_("master_ssd_eviction_attempts",
+                             "Total number of attempted SSD eviction "
+                             "operations"),
+      ssd_evicted_key_count_("master_ssd_evicted_key_count",
+                             "Total number of keys evicted from SSD pool"),
+      ssd_evicted_size_("master_ssd_evicted_size",
+                        "Total bytes evicted from SSD pool"),
+      ssd_extent_release_fail_total_(
+          "master_ssd_extent_release_fail_total",
+          "Total number of failed SSD extent release operations"),
+      ssd_spdk_io_submit_total_("ssd_spdk_io_submit_total",
+                                "Total number of SPDK SSD I/O submissions"),
+      ssd_spdk_io_timeout_total_("ssd_spdk_io_timeout_total",
+                                 "Total number of SPDK SSD I/O timeouts"),
+      ssd_spdk_io_fail_total_("ssd_spdk_io_fail_total",
+                              "Total number of SPDK SSD I/O failures"),
+      ssd_connect_fail_total_("ssd_connect_fail_total",
+                              "Total number of SSD target connect failures"),
+      ssd_target_health_("ssd_target_health",
+                         "Current SSD target health status", {"target"}),
 
       // Initialize Discarded Replicas Counters
       put_start_discard_cnt_("master_put_start_discard_cnt",
@@ -442,6 +465,15 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     eviction_attempts_.inc(0);
     evicted_key_count_.inc(0);
     evicted_size_.inc(0);
+    ssd_eviction_success_.inc(0);
+    ssd_eviction_attempts_.inc(0);
+    ssd_evicted_key_count_.inc(0);
+    ssd_evicted_size_.inc(0);
+    ssd_extent_release_fail_total_.inc(0);
+    ssd_spdk_io_submit_total_.inc(0);
+    ssd_spdk_io_timeout_total_.inc(0);
+    ssd_spdk_io_fail_total_.inc(0);
+    ssd_connect_fail_total_.inc(0);
 
     // Update PutStart Discard Metrics
     put_start_discard_cnt_.inc(0);
@@ -1079,6 +1111,43 @@ void MasterMetricManager::inc_eviction_success(int64_t key_count,
 
 void MasterMetricManager::inc_eviction_fail() { eviction_attempts_.inc(); }
 
+void MasterMetricManager::inc_ssd_eviction_success(int64_t key_count,
+                                                   int64_t size) {
+    ssd_evicted_key_count_.inc(key_count);
+    ssd_evicted_size_.inc(size);
+    ssd_eviction_success_.inc();
+    ssd_eviction_attempts_.inc();
+}
+
+void MasterMetricManager::inc_ssd_eviction_fail() {
+    ssd_eviction_attempts_.inc();
+}
+
+void MasterMetricManager::inc_ssd_extent_release_fail(int64_t val) {
+    ssd_extent_release_fail_total_.inc(val);
+}
+
+void MasterMetricManager::inc_ssd_spdk_io_submit_total(int64_t val) {
+    ssd_spdk_io_submit_total_.inc(val);
+}
+
+void MasterMetricManager::inc_ssd_spdk_io_timeout_total(int64_t val) {
+    ssd_spdk_io_timeout_total_.inc(val);
+}
+
+void MasterMetricManager::inc_ssd_spdk_io_fail_total(int64_t val) {
+    ssd_spdk_io_fail_total_.inc(val);
+}
+
+void MasterMetricManager::inc_ssd_connect_fail_total(int64_t val) {
+    ssd_connect_fail_total_.inc(val);
+}
+
+void MasterMetricManager::set_ssd_target_health(
+    const std::string& target_endpoint, double health) {
+    ssd_target_health_.update({target_endpoint}, health);
+}
+
 int64_t MasterMetricManager::get_eviction_success() {
     return eviction_success_.value();
 }
@@ -1093,6 +1162,42 @@ int64_t MasterMetricManager::get_evicted_key_count() {
 
 int64_t MasterMetricManager::get_evicted_size() {
     return evicted_size_.value();
+}
+
+int64_t MasterMetricManager::get_ssd_eviction_success() {
+    return ssd_eviction_success_.value();
+}
+
+int64_t MasterMetricManager::get_ssd_eviction_attempts() {
+    return ssd_eviction_attempts_.value();
+}
+
+int64_t MasterMetricManager::get_ssd_evicted_key_count() {
+    return ssd_evicted_key_count_.value();
+}
+
+int64_t MasterMetricManager::get_ssd_evicted_size() {
+    return ssd_evicted_size_.value();
+}
+
+int64_t MasterMetricManager::get_ssd_extent_release_fail_total() {
+    return ssd_extent_release_fail_total_.value();
+}
+
+int64_t MasterMetricManager::get_ssd_spdk_io_submit_total() {
+    return ssd_spdk_io_submit_total_.value();
+}
+
+int64_t MasterMetricManager::get_ssd_spdk_io_timeout_total() {
+    return ssd_spdk_io_timeout_total_.value();
+}
+
+int64_t MasterMetricManager::get_ssd_spdk_io_fail_total() {
+    return ssd_spdk_io_fail_total_.value();
+}
+
+int64_t MasterMetricManager::get_ssd_connect_fail_total() {
+    return ssd_connect_fail_total_.value();
 }
 
 // PutStart Discard Metrics Getters
@@ -1368,6 +1473,16 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(eviction_attempts_);
     serialize_metric(evicted_key_count_);
     serialize_metric(evicted_size_);
+    serialize_metric(ssd_eviction_success_);
+    serialize_metric(ssd_eviction_attempts_);
+    serialize_metric(ssd_evicted_key_count_);
+    serialize_metric(ssd_evicted_size_);
+    serialize_metric(ssd_extent_release_fail_total_);
+    serialize_metric(ssd_spdk_io_submit_total_);
+    serialize_metric(ssd_spdk_io_timeout_total_);
+    serialize_metric(ssd_spdk_io_fail_total_);
+    serialize_metric(ssd_connect_fail_total_);
+    serialize_metric(ssd_target_health_);
 
     // Serialize PutStart Discard Metrics
     serialize_metric(put_start_discard_cnt_);
@@ -1556,6 +1671,11 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t eviction_attempts = eviction_attempts_.value();
     int64_t evicted_key_count = evicted_key_count_.value();
     int64_t evicted_size = evicted_size_.value();
+    int64_t ssd_eviction_success = ssd_eviction_success_.value();
+    int64_t ssd_eviction_attempts = ssd_eviction_attempts_.value();
+    int64_t ssd_evicted_key_count = ssd_evicted_key_count_.value();
+    int64_t ssd_evicted_size = ssd_evicted_size_.value();
+    int64_t ssd_extent_release_fail_total = ssd_extent_release_fail_total_.value();
 
     // Ping counters
     int64_t ping = ping_requests_.value();
@@ -1677,6 +1797,12 @@ std::string MasterMetricManager::get_summary_string() {
        << ", "
        << "keys=" << evicted_key_count << ", "
        << "size=" << byte_size_to_string(evicted_size);
+    ss << " | SSD Eviction: "
+       << "Success/Attempts=" << ssd_eviction_success << "/"
+       << ssd_eviction_attempts << ", "
+       << "keys=" << ssd_evicted_key_count << ", "
+       << "size=" << byte_size_to_string(ssd_evicted_size) << ", "
+       << "release_fail=" << ssd_extent_release_fail_total;
 
     // Discard summary
     ss << " | Discard: "

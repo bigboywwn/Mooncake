@@ -2,6 +2,7 @@
 
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
@@ -212,12 +213,30 @@ class MasterMetricManager {
     // Eviction Metrics
     void inc_eviction_success(int64_t key_count, int64_t size);
     void inc_eviction_fail();  // not a single object is evicted
+    void inc_ssd_eviction_success(int64_t key_count, int64_t size);
+    void inc_ssd_eviction_fail();  // not a single object is evicted
+    void inc_ssd_extent_release_fail(int64_t val = 1);
+    void inc_ssd_spdk_io_submit_total(int64_t val = 1);
+    void inc_ssd_spdk_io_timeout_total(int64_t val = 1);
+    void inc_ssd_spdk_io_fail_total(int64_t val = 1);
+    void inc_ssd_connect_fail_total(int64_t val = 1);
+    void set_ssd_target_health(const std::string& target_endpoint,
+                               double health);
 
     // Eviction Metrics Getters
     int64_t get_eviction_success();
     int64_t get_eviction_attempts();
     int64_t get_evicted_key_count();
     int64_t get_evicted_size();
+    int64_t get_ssd_eviction_success();
+    int64_t get_ssd_eviction_attempts();
+    int64_t get_ssd_evicted_key_count();
+    int64_t get_ssd_evicted_size();
+    int64_t get_ssd_extent_release_fail_total();
+    int64_t get_ssd_spdk_io_submit_total();
+    int64_t get_ssd_spdk_io_timeout_total();
+    int64_t get_ssd_spdk_io_fail_total();
+    int64_t get_ssd_connect_fail_total();
 
     // PutStart Discard Metrics
     void inc_put_start_discard_cnt(int64_t count, int64_t size);
@@ -421,6 +440,16 @@ class MasterMetricManager {
     ylt::metric::counter_t eviction_attempts_;
     ylt::metric::counter_t evicted_key_count_;
     ylt::metric::counter_t evicted_size_;
+    ylt::metric::counter_t ssd_eviction_success_;
+    ylt::metric::counter_t ssd_eviction_attempts_;
+    ylt::metric::counter_t ssd_evicted_key_count_;
+    ylt::metric::counter_t ssd_evicted_size_;
+    ylt::metric::counter_t ssd_extent_release_fail_total_;
+    ylt::metric::counter_t ssd_spdk_io_submit_total_;
+    ylt::metric::counter_t ssd_spdk_io_timeout_total_;
+    ylt::metric::counter_t ssd_spdk_io_fail_total_;
+    ylt::metric::counter_t ssd_connect_fail_total_;
+    ylt::metric::dynamic_gauge_1t ssd_target_health_;
 
     // PutStart Discard Metrics
     ylt::metric::counter_t put_start_discard_cnt_;

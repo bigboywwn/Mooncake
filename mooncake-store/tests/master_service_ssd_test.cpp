@@ -3,7 +3,10 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -26,6 +29,352 @@ class MasterServiceSSDTest : public ::testing::Test {
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
+
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* key, const char* value) : key_(key) {
+        const char* old = std::getenv(key);
+        if (old != nullptr) {
+            had_old_ = true;
+            old_value_ = old;
+        }
+        setenv(key_, value, 1);
+    }
+
+    ~ScopedEnvVar() {
+        if (had_old_) {
+            setenv(key_, old_value_.c_str(), 1);
+        } else {
+            unsetenv(key_);
+        }
+    }
+
+   private:
+    const char* key_;
+    bool had_old_{false};
+    std::string old_value_;
+};
+
+TEST_F(MasterServiceSSDTest, PutStartReturnsSsdPoolDescriptorWhenEnabled) {
+    ScopedEnvVar enabled("MC_SSD_POOL_ENABLED", "1");
+    ScopedEnvVar targets("MC_SSD_POOL_TARGETS", "file:///tmp/mooncake-ssd-a.bin");
+
+    auto service = std::make_unique<MasterService>(MasterServiceConfig::builder().build());
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = 0x300000000;
+    segment.size = 1024 * 1024 * 64;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start = service->PutStart(client_id, "ssd_enabled_key", 4096, config);
+    ASSERT_TRUE(put_start.has_value());
+
+    bool has_memory = false;
+    bool has_ssd = false;
+    for (const auto& rep : put_start.value()) {
+        if (rep.is_memory_replica()) {
+            has_memory = true;
+        }
+        if (rep.is_ssd_pool_replica()) {
+            has_ssd = true;
+        }
+    }
+    EXPECT_TRUE(has_memory);
+    EXPECT_TRUE(has_ssd);
+}
+
+TEST_F(MasterServiceSSDTest, ConsistentHashSelectsStableTargetForSameKey) {
+    ScopedEnvVar enabled("MC_SSD_POOL_ENABLED", "1");
+    ScopedEnvVar ddr_enabled("MC_DDR_POOL_ENABLED", "0");
+    ScopedEnvVar targets(
+        "MC_SSD_TARGETS_JSON",
+        R"([{"name":"t1","trtype":"tcp","traddr":"10.10.10.1","trsvcid":"4420","subnqn":"nqn.2026-03.io.mooncake:ssdpool","nsid":1,"capacity_bytes":10485760,"weight":1},{"name":"t2","trtype":"tcp","traddr":"10.10.10.2","trsvcid":"4420","subnqn":"nqn.2026-03.io.mooncake:ssdpool","nsid":1,"capacity_bytes":10485760,"weight":1}])");
+
+    auto service = std::make_unique<MasterService>(
+        MasterServiceConfig::builder().set_root_fs_dir("").build());
+    UUID client_id = generate_uuid();
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto first = service->PutStart(client_id, "stable-key", 4096, config);
+    ASSERT_TRUE(first.has_value());
+    std::string first_endpoint;
+    for (const auto& rep : first.value()) {
+        if (rep.is_ssd_pool_replica()) {
+            first_endpoint = rep.get_ssd_extent_descriptor().target_endpoint;
+            break;
+        }
+    }
+    ASSERT_FALSE(first_endpoint.empty());
+    ASSERT_TRUE(
+        service->PutRevoke(client_id, "stable-key", ReplicaType::SSD_POOL)
+            .has_value());
+
+    auto second = service->PutStart(client_id, "stable-key", 4096, config);
+    ASSERT_TRUE(second.has_value());
+    std::string second_endpoint;
+    for (const auto& rep : second.value()) {
+        if (rep.is_ssd_pool_replica()) {
+            second_endpoint = rep.get_ssd_extent_descriptor().target_endpoint;
+            break;
+        }
+    }
+    ASSERT_FALSE(second_endpoint.empty());
+    EXPECT_EQ(first_endpoint, second_endpoint);
+}
+
+TEST_F(MasterServiceSSDTest, ConsistentHashHonorsWeight) {
+    ScopedEnvVar enabled("MC_SSD_POOL_ENABLED", "1");
+    ScopedEnvVar ddr_enabled("MC_DDR_POOL_ENABLED", "0");
+    ScopedEnvVar targets(
+        "MC_SSD_TARGETS_JSON",
+        R"([{"name":"w1","trtype":"tcp","traddr":"10.10.20.1","trsvcid":"4420","subnqn":"nqn.2026-03.io.mooncake:ssdpool","nsid":1,"capacity_bytes":536870912,"weight":1},{"name":"w3","trtype":"tcp","traddr":"10.10.20.2","trsvcid":"4420","subnqn":"nqn.2026-03.io.mooncake:ssdpool","nsid":1,"capacity_bytes":536870912,"weight":3}])");
+
+    auto service = std::make_unique<MasterService>(
+        MasterServiceConfig::builder().set_root_fs_dir("").build());
+    UUID client_id = generate_uuid();
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    int count_w1 = 0;
+    int count_w3 = 0;
+    for (int i = 0; i < 128; ++i) {
+        const std::string key = "weight-key-" + std::to_string(i);
+        auto put_start = service->PutStart(client_id, key, 4096, config);
+        ASSERT_TRUE(put_start.has_value());
+        std::string endpoint;
+        for (const auto& rep : put_start.value()) {
+            if (rep.is_ssd_pool_replica()) {
+                endpoint = rep.get_ssd_extent_descriptor().target_endpoint;
+                break;
+            }
+        }
+        ASSERT_FALSE(endpoint.empty());
+        if (endpoint == "10.10.20.1:4420") {
+            ++count_w1;
+        } else if (endpoint == "10.10.20.2:4420") {
+            ++count_w3;
+        }
+        ASSERT_TRUE(service->PutRevoke(client_id, key, ReplicaType::SSD_POOL)
+                        .has_value());
+    }
+    EXPECT_GT(count_w3, count_w1);
+}
+
+TEST_F(MasterServiceSSDTest, BatchReplicaClearAllReleasesSsdExtent) {
+    ScopedEnvVar enabled("MC_SSD_POOL_ENABLED", "1");
+    ScopedEnvVar targets("MC_SSD_POOL_TARGETS", "10.10.30.1:4420");
+    ScopedEnvVar capacity("MC_SSD_POOL_CAPACITY_BYTES", "4096");
+    ScopedEnvVar block_size("MC_SSD_POOL_BLOCK_SIZE", "4096");
+
+    auto service = std::make_unique<MasterService>(
+        MasterServiceConfig::builder()
+            .set_root_fs_dir("")
+            .set_default_kv_lease_ttl(0)
+            .build());
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = 0x3A0000000;
+    segment.size = 1024 * 1024 * 64;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto first = service->PutStart(client_id, "clear-all-key-1", 1024, config);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(
+        service->PutEnd(client_id, "clear-all-key-1", ReplicaType::MEMORY)
+            .has_value());
+    ASSERT_TRUE(
+        service->PutEnd(client_id, "clear-all-key-1", ReplicaType::SSD_POOL)
+            .has_value());
+
+    auto clear_result =
+        service->BatchReplicaClear({"clear-all-key-1"}, client_id, "");
+    ASSERT_TRUE(clear_result.has_value());
+    ASSERT_EQ(clear_result.value().size(), 1);
+
+    auto second = service->PutStart(client_id, "clear-all-key-2", 1024, config);
+    ASSERT_TRUE(second.has_value());
+    bool has_ssd = false;
+    for (const auto& rep : second.value()) {
+        if (rep.is_ssd_pool_replica()) {
+            has_ssd = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_ssd);
+}
+
+TEST_F(MasterServiceSSDTest, TieredConfigReflectsSsdOnlyWhenDdrDisabled) {
+    ScopedEnvVar enabled("MC_SSD_POOL_ENABLED", "1");
+    ScopedEnvVar ddr_enabled("MC_DDR_POOL_ENABLED", "0");
+    ScopedEnvVar targets("MC_SSD_POOL_TARGETS", "10.10.40.1:4420");
+
+    auto service = std::make_unique<MasterService>(
+        MasterServiceConfig::builder().set_root_fs_dir("").build());
+    UUID client_id = generate_uuid();
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto put_start = service->PutStart(client_id, "ssd-only-key", 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    bool has_memory = false;
+    bool has_ssd = false;
+    for (const auto& rep : put_start.value()) {
+        has_memory = has_memory || rep.is_memory_replica();
+        has_ssd = has_ssd || rep.is_ssd_pool_replica();
+    }
+    EXPECT_FALSE(has_memory);
+    EXPECT_TRUE(has_ssd);
+
+    auto tiered = service->GetTieredStorageConfig();
+    ASSERT_TRUE(tiered.has_value());
+    auto tiers = tiered.value().enabled_tiers;
+    EXPECT_TRUE(std::find(tiers.begin(), tiers.end(), "SSD") != tiers.end());
+    EXPECT_TRUE(std::find(tiers.begin(), tiers.end(), "DDR") == tiers.end());
+}
+
+TEST_F(MasterServiceSSDTest, QueryPrefersMemoryThenSsdThenDisk) {
+    ScopedEnvVar enabled("MC_SSD_POOL_ENABLED", "1");
+    ScopedEnvVar targets("MC_SSD_POOL_TARGETS", "file:///tmp/mooncake-ssd-b.bin");
+
+    auto service = CreateMasterServiceWithSSDFeat("/mnt/ssd");
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = 0x310000000;
+    segment.size = 1024 * 1024 * 64;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "query_priority_key";
+    ASSERT_TRUE(service->PutStart(client_id, key, 1024, config).has_value());
+
+    ASSERT_TRUE(service->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(service->PutEnd(client_id, key, ReplicaType::SSD_POOL).has_value());
+    ASSERT_TRUE(service->PutEnd(client_id, key, ReplicaType::DISK).has_value());
+
+    auto query = service->GetReplicaList(key);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_FALSE(query.value().replicas.empty());
+    EXPECT_TRUE(query.value().replicas.front().is_memory_replica());
+
+    ASSERT_TRUE(service->PutRevoke(client_id, key, ReplicaType::MEMORY).has_value());
+    query = service->GetReplicaList(key);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_FALSE(query.value().replicas.empty());
+    EXPECT_TRUE(query.value().replicas.front().is_ssd_pool_replica());
+}
+
+TEST_F(MasterServiceSSDTest, PutRevokeSsdReleasesExtentCapacity) {
+    ScopedEnvVar enabled("MC_SSD_POOL_ENABLED", "1");
+    ScopedEnvVar targets("MC_SSD_POOL_TARGETS", "file:///tmp/mooncake-ssd-c.bin");
+    ScopedEnvVar capacity("MC_SSD_POOL_CAPACITY_BYTES", "4096");
+    ScopedEnvVar block_size("MC_SSD_POOL_BLOCK_SIZE", "4096");
+
+    auto service = std::make_unique<MasterService>(
+        MasterServiceConfig::builder().set_root_fs_dir("").build());
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = 0x320000000;
+    segment.size = 1024 * 1024 * 64;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start_1 = service->PutStart(client_id, "ssd_revoke_key_1", 1024, config);
+    ASSERT_TRUE(put_start_1.has_value());
+    bool has_ssd_1 = false;
+    for (const auto& rep : put_start_1.value()) {
+        if (rep.is_ssd_pool_replica()) {
+            has_ssd_1 = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(has_ssd_1);
+
+    ASSERT_TRUE(service->PutRevoke(client_id, "ssd_revoke_key_1",
+                                   ReplicaType::SSD_POOL)
+                    .has_value());
+    ASSERT_TRUE(service->PutRevoke(client_id, "ssd_revoke_key_1",
+                                   ReplicaType::MEMORY)
+                    .has_value());
+
+    auto put_start_2 = service->PutStart(client_id, "ssd_revoke_key_2", 1024, config);
+    ASSERT_TRUE(put_start_2.has_value());
+    bool has_ssd_2 = false;
+    for (const auto& rep : put_start_2.value()) {
+        if (rep.is_ssd_pool_replica()) {
+            has_ssd_2 = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_ssd_2);
+}
+
+TEST_F(MasterServiceSSDTest, RemoveReleasesSsdExtentCapacity) {
+    ScopedEnvVar enabled("MC_SSD_POOL_ENABLED", "1");
+    ScopedEnvVar targets("MC_SSD_POOL_TARGETS", "file:///tmp/mooncake-ssd-d.bin");
+    ScopedEnvVar capacity("MC_SSD_POOL_CAPACITY_BYTES", "4096");
+    ScopedEnvVar block_size("MC_SSD_POOL_BLOCK_SIZE", "4096");
+
+    auto service = std::make_unique<MasterService>(
+        MasterServiceConfig::builder()
+            .set_root_fs_dir("")
+            .set_default_kv_lease_ttl(0)
+            .build());
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = 0x330000000;
+    segment.size = 1024 * 1024 * 64;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start_1 = service->PutStart(client_id, "ssd_remove_key_1", 1024, config);
+    ASSERT_TRUE(put_start_1.has_value());
+    ASSERT_TRUE(service->PutEnd(client_id, "ssd_remove_key_1", ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service->PutEnd(client_id, "ssd_remove_key_1", ReplicaType::SSD_POOL)
+                    .has_value());
+
+    ASSERT_TRUE(service->Remove("ssd_remove_key_1").has_value());
+
+    auto put_start_2 = service->PutStart(client_id, "ssd_remove_key_2", 1024, config);
+    ASSERT_TRUE(put_start_2.has_value());
+    bool has_ssd = false;
+    for (const auto& rep : put_start_2.value()) {
+        if (rep.is_ssd_pool_replica()) {
+            has_ssd = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_ssd);
+}
 
 TEST_F(MasterServiceSSDTest, PutEndBothReplica) {
     auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");

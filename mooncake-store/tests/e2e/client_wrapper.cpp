@@ -1,5 +1,6 @@
 #include "client_wrapper.h"
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -105,10 +106,28 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
         return ErrorCode::OBJECT_NOT_FOUND;
     }
 
-    // Create slices
-    const AllocatedBuffer::Descriptor& descriptor =
-        replica_list[0].get_memory_descriptor().buffer_descriptor;
-    SliceGuard slice_guard(descriptor.size_, allocator_);
+    size_t object_size = 0;
+    const auto& descriptor = replica_list[0];
+    if (descriptor.is_memory_replica()) {
+        object_size = descriptor.get_memory_descriptor().buffer_descriptor.size_;
+    } else if (descriptor.is_ssd_pool_replica()) {
+        const auto& ssd_desc = descriptor.get_ssd_extent_descriptor();
+        object_size = ssd_desc.object_size > 0
+                          ? static_cast<size_t>(ssd_desc.object_size)
+                          : static_cast<size_t>(ssd_desc.lba_count) *
+                                ssd_desc.block_size;
+    } else if (descriptor.is_disk_replica()) {
+        object_size =
+            static_cast<size_t>(descriptor.get_disk_descriptor().object_size);
+    } else if (descriptor.is_local_disk_replica()) {
+        object_size = static_cast<size_t>(
+            descriptor.get_local_disk_descriptor().object_size);
+    }
+    if (object_size == 0) {
+        return ErrorCode::INVALID_REPLICA;
+    }
+
+    SliceGuard slice_guard(object_size, allocator_);
 
     // Perform get operation
     auto get_result =
@@ -121,8 +140,14 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
 
     // Fill value
     value.clear();
+    size_t remain = object_size;
     for (const auto& slice : slice_guard.slices_) {
-        value.append(static_cast<const char*>(slice.ptr), slice.size);
+        if (remain == 0) {
+            break;
+        }
+        const size_t copy_size = std::min(remain, slice.size);
+        value.append(static_cast<const char*>(slice.ptr), copy_size);
+        remain -= copy_size;
     }
     return ErrorCode::OK;
 }
