@@ -107,6 +107,8 @@ python-api-reference/ep-backend
 
 design/architecture
 design/mooncake-store
+design/mooncake-store-tiered-storage-v1
+design/mooncake-store-tiered-storage-ddr-ssd-v1-test-suite
 design/p2p-store
 design/transfer-engine/index
 design/tent/overview
