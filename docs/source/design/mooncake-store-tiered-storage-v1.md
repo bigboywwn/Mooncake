@@ -226,6 +226,10 @@ evict SSD 前必须检查“最后 `COMPLETE` 副本保护”：
 6. `master_ssd_eviction_success`
 7. `master_ssd_eviction_attempts`
 8. `master_ssd_extent_release_fail_total`
+9. `ssd_queue_full_total`
+10. `ssd_reactor_cpu_usage_pct`
+11. `ssd_async_sink_queue_depth`
+12. `ssd_async_sink_queue_lag_ms`
 
 ---
 
@@ -244,22 +248,24 @@ evict SSD 前必须检查“最后 `COMPLETE` 副本保护”：
 
 ---
 
-## 11. 当前验证结论（基于本轮提交）
+## 11. 增量闭环（Review Delta）
 
-### 11.1 已验证通过
+### 11.1 阻塞项闭环状态
 
-1. `STORE_USE_SPDK=ON` 可编译。
-2. `SSD-only + SPDK` 手工 `Put/Get` 通过。
-3. target 侧 `bdev_get_iostat` 计数增长可证明 I/O 真实到达 NVMeoF target。
+1. **B1（BatchGet 降级）**：`BatchGet` 对 non-memory 首副本与 batch 路径失败 key 统一回退 `ReadWithFallback`，不再因 `SSD_POOL` 直接失败。
+2. **B2（一致性哈希名实一致）**：`SSDPoolManager` 已改为加权 hash ring（`FNV-1a + vnode + ring scan`），不再使用轮询。
+3. **B3（extent 生命周期）**：`BatchReplicaClear(clear_all/segment)`、`PutRevoke`、`Remove*`、`evict` 均接入 `ReleaseExtent` 闭环。
+4. **B4（启动与异步失败闭环）**：SSD tier 启用时 `InitSsdIoEngine` 失败 fail-fast；异步 SSD 写成功/失败均通过 `ReportSsdWriteResult` 上报，失败走 `PutRevoke(SSD_POOL)`。
+5. **SPDK 多 client 初始化稳定性**：引入进程级 `SpdkRuntimeManager`（`Acquire/Release + refcount`），避免 `spdk_env_init` 重入崩溃。
 
-### 11.2 当前已知缺口
+### 11.2 本轮自验证（2026-03-06，ubuntu-build）
 
-`client_integration_test` 在同进程多 client 场景下会触发：
+1. 构建：`STORE_USE_SPDK=ON` 下 `mooncake_master/mooncake_client/clientctl/master_service_ssd_test/master_metrics_test/client_integration_test` 全部可编译。
+2. 单测：`master_service_ssd_test` 全量 20/20 PASS。
+3. 指标测试：`master_metrics_test` 全量 5/5 PASS（含新增 SSD 可观测指标断言）。
+4. 集成测试：`client_integration_test` 全量 14/14 PASS（含 `SsdOnly*` 与 `ClientFailFastSsdTest`）。
 
-- `Invalid arguments to reinitialize SPDK env`
-- 根因：`spdk_env_init` 重复初始化缺少进程级单例/引用计数治理
-
-该问题不影响单 client 手工链路验证，但会阻塞多 client 自动化测试稳定性。
+验证机约束：仅使用 `ubuntu-build`，未使用 `ubuntu-test`。
 
 ---
 
@@ -273,4 +279,4 @@ evict SSD 前必须检查“最后 `COMPLETE` 副本保护”：
 6. `ReportSsdWriteResult` 必须覆盖成功与失败两条路径。
 7. `SSD-only` 必须可运行。
 8. SPDK fail-fast 语义必须保持。
-9. 多 client SPDK runtime 单例化问题需在后续修复并补回归。
+9. 多 client SPDK runtime 单例化已落地并通过集成回归。

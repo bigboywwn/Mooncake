@@ -51,6 +51,31 @@ UUID ParseClientId(const std::string& client_id_str) {
     return client_id;
 }
 
+class ScopedEnvVarForTest {
+   public:
+    ScopedEnvVarForTest(const char* key, const std::string& value) : key_(key) {
+        const char* old = std::getenv(key);
+        if (old != nullptr) {
+            had_old_ = true;
+            old_value_ = old;
+        }
+        setenv(key_, value.c_str(), 1);
+    }
+
+    ~ScopedEnvVarForTest() {
+        if (had_old_) {
+            setenv(key_, old_value_.c_str(), 1);
+        } else {
+            unsetenv(key_);
+        }
+    }
+
+   private:
+    const char* key_;
+    bool had_old_{false};
+    std::string old_value_;
+};
+
 class ClientIdCaptureSink : public google::LogSink {
    public:
     std::string captured_client_id;
@@ -1458,6 +1483,138 @@ TEST_F(EvictionNotificationTest, DiskReplicaRemovedAfterEviction) {
     EXPECT_TRUE(unmount.has_value()) << "UnmountSegment failed";
     std::free(seg_ptr_);
     seg_ptr_ = nullptr;
+}
+
+class SsdOnlyClientIntegrationTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        ssd_file_ = std::filesystem::temp_directory_path() /
+                    ("mc_ssd_only_" + std::to_string(::getpid()) + ".bin");
+        target_value_ = "file://" + ssd_file_.string();
+        ssd_enabled_env_ =
+            std::make_unique<ScopedEnvVarForTest>("MC_SSD_POOL_ENABLED", "1");
+        ddr_enabled_env_ =
+            std::make_unique<ScopedEnvVarForTest>("MC_DDR_POOL_ENABLED", "0");
+        impl_env_ = std::make_unique<ScopedEnvVarForTest>(
+            "MC_NVMEOF_CLIENT_IMPL", "legacy");
+        target_json_env_ =
+            std::make_unique<ScopedEnvVarForTest>("MC_SSD_TARGETS_JSON", "");
+        target_env_ = std::make_unique<ScopedEnvVarForTest>(
+            "MC_SSD_POOL_TARGETS", target_value_);
+        capacity_env_ = std::make_unique<ScopedEnvVarForTest>(
+            "MC_SSD_POOL_CAPACITY_BYTES", "33554432");
+        block_env_ = std::make_unique<ScopedEnvVarForTest>("MC_SSD_POOL_BLOCK_SIZE",
+                                                           "4096");
+
+        auto config = InProcMasterConfigBuilder()
+                          .set_default_kv_lease_ttl(30000)
+                          .set_root_fs_dir(std::filesystem::temp_directory_path()
+                                               .string())
+                          .build();
+        ASSERT_TRUE(master_.Start(config));
+
+        auto client_opt = Client::Create("localhost:17950", "P2PHANDSHAKE",
+                                         FLAGS_protocol, std::nullopt,
+                                         master_.master_address());
+        ASSERT_TRUE(client_opt.has_value());
+        client_ = client_opt.value();
+    }
+
+    void TearDown() override {
+        client_.reset();
+        master_.Stop();
+        std::error_code ec;
+        std::filesystem::remove(ssd_file_, ec);
+    }
+
+    InProcMaster master_;
+    std::shared_ptr<Client> client_;
+    std::filesystem::path ssd_file_;
+    std::string target_value_;
+    std::unique_ptr<ScopedEnvVarForTest> ssd_enabled_env_;
+    std::unique_ptr<ScopedEnvVarForTest> ddr_enabled_env_;
+    std::unique_ptr<ScopedEnvVarForTest> impl_env_;
+    std::unique_ptr<ScopedEnvVarForTest> target_json_env_;
+    std::unique_ptr<ScopedEnvVarForTest> target_env_;
+    std::unique_ptr<ScopedEnvVarForTest> capacity_env_;
+    std::unique_ptr<ScopedEnvVarForTest> block_env_;
+};
+
+TEST_F(SsdOnlyClientIntegrationTest, SsdOnlyPutGet) {
+    const std::string key = "ssd_only_put_get_key";
+    const std::string payload = "ssd-only-payload";
+    std::vector<Slice> put_slices;
+    put_slices.emplace_back(Slice{const_cast<char*>(payload.data()),
+                                  payload.size()});
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_result = client_->Put(key, put_slices, config);
+    ASSERT_TRUE(put_result.has_value()) << toString(put_result.error());
+
+    auto query = client_->Query(key);
+    ASSERT_TRUE(query.has_value()) << toString(query.error());
+    ASSERT_FALSE(query.value().replicas.empty());
+    EXPECT_TRUE(query.value().replicas.front().is_ssd_pool_replica());
+
+    std::vector<char> out(payload.size(), 0);
+    std::vector<Slice> get_slices;
+    get_slices.emplace_back(Slice{out.data(), out.size()});
+    auto get_result = client_->Get(key, get_slices);
+    ASSERT_TRUE(get_result.has_value()) << toString(get_result.error());
+    EXPECT_EQ(std::string(out.begin(), out.end()), payload);
+}
+
+TEST_F(SsdOnlyClientIntegrationTest, SsdOnlyBatchPutBatchGet) {
+    std::vector<std::string> keys = {"ssd_batch_k1", "ssd_batch_k2"};
+    std::vector<std::string> payloads = {"ssd-batch-v1", "ssd-batch-v2"};
+
+    std::vector<std::vector<Slice>> put_batches(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        put_batches[i].push_back(
+            Slice{const_cast<char*>(payloads[i].data()), payloads[i].size()});
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_results = client_->BatchPut(keys, put_batches, config);
+    ASSERT_EQ(put_results.size(), keys.size());
+    for (const auto& r : put_results) {
+        ASSERT_TRUE(r.has_value()) << toString(r.error());
+    }
+
+    std::unordered_map<std::string, std::vector<Slice>> get_batches;
+    std::vector<std::vector<char>> outputs(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        outputs[i].resize(payloads[i].size());
+        get_batches[keys[i]].push_back(
+            Slice{outputs[i].data(), outputs[i].size()});
+    }
+    auto get_results = client_->BatchGet(keys, get_batches);
+    ASSERT_EQ(get_results.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(get_results[i].has_value())
+            << "key=" << keys[i] << ", err=" << toString(get_results[i].error());
+        EXPECT_EQ(std::string(outputs[i].begin(), outputs[i].end()), payloads[i]);
+    }
+}
+
+TEST(ClientFailFastSsdTest, CreateFailsWhenSpdkEnabledWithoutReachableTarget) {
+    ScopedEnvVarForTest ssd_enabled("MC_SSD_POOL_ENABLED", "1");
+    ScopedEnvVarForTest ddr_enabled("MC_DDR_POOL_ENABLED", "0");
+    ScopedEnvVarForTest impl_mode("MC_NVMEOF_CLIENT_IMPL", "spdk");
+    ScopedEnvVarForTest target_json(
+        "MC_SSD_TARGETS_JSON",
+        R"([{"name":"bad","trtype":"tcp","traddr":"127.0.0.1","trsvcid":"65535","subnqn":"nqn.2026-03.io.mooncake:ssdpool","nsid":1,"capacity_bytes":1048576,"weight":1}])");
+    ScopedEnvVarForTest fallback_target("MC_SSD_POOL_TARGETS", "");
+
+    InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
+    auto client_opt = Client::Create("localhost:17960", "P2PHANDSHAKE",
+                                     FLAGS_protocol, std::nullopt,
+                                     master.master_address());
+    EXPECT_FALSE(client_opt.has_value());
+    master.Stop();
 }
 
 }  // namespace testing

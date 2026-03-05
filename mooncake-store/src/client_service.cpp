@@ -2350,7 +2350,7 @@ void Client::PutToSsdPool(const std::string& key,
         LOG(ERROR) << "SsdIoEngine not initialized for key=" << key
                    << ", report failure to master";
         auto report_result = master_client_.ReportSsdWriteResult(
-            key, ssd_descriptor.extent_id, false);
+            key, ssd_descriptor.extent_id, false, ErrorCode::SSD_IO_SUBMIT_FAIL);
         if (!report_result.has_value()) {
             LOG(ERROR) << "ReportSsdWriteResult failed for key=" << key
                        << ", error=" << toString(report_result.error());
@@ -2372,9 +2372,25 @@ void Client::PutToSsdPool(const std::string& key,
         value.append(static_cast<char*>(slice.ptr), slice.size);
     }
 
+    const auto enqueue_time = std::chrono::steady_clock::now();
+    const int64_t queue_depth =
+        static_cast<int64_t>(ssd_async_sink_queue_depth_.fetch_add(
+                                 1, std::memory_order_relaxed)) +
+        1;
+    MasterMetricManager::instance().set_ssd_async_sink_queue_depth(queue_depth);
+
     write_thread_pool_.enqueue([this, key, ssd_descriptor,
-                                value = std::move(value)]() mutable {
+                                value = std::move(value), enqueue_time]() mutable {
+        const auto now = std::chrono::steady_clock::now();
+        const int64_t lag_ms = std::max<int64_t>(
+            0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                   now - enqueue_time)
+                   .count());
+        MasterMetricManager::instance().set_ssd_async_sink_queue_lag_ms(lag_ms);
+
         constexpr int kMaxRetry = 3;
+        ErrorCode last_io_err = ErrorCode::SSD_IO_RETRY_EXHAUSTED;
+        bool success = false;
         for (int attempt = 1; attempt <= kMaxRetry; ++attempt) {
             std::vector<Slice> copied_slices;
             Slice copied_slice;
@@ -2385,27 +2401,41 @@ void Client::PutToSsdPool(const std::string& key,
             ErrorCode io_err = ssd_io_engine_->Write(ssd_descriptor, copied_slices);
             if (io_err == ErrorCode::OK) {
                 auto report_result = master_client_.ReportSsdWriteResult(
-                    key, ssd_descriptor.extent_id, true);
+                    key, ssd_descriptor.extent_id, true, ErrorCode::OK);
                 if (!report_result) {
                     LOG(ERROR) << "Failed to report SSD write success for key="
                                << key << ", error="
                                << toString(report_result.error());
                 }
-                return;
+                success = true;
+                break;
             }
+            last_io_err = io_err;
 
             LOG(WARNING) << "SSD async write failed for key=" << key
                          << ", attempt=" << attempt
                          << ", error=" << toString(io_err);
             std::this_thread::sleep_for(std::chrono::milliseconds(100 * attempt));
         }
-        LOG(ERROR) << "SSD async write exhausted retries for key=" << key;
-        auto report_result = master_client_.ReportSsdWriteResult(
-            key, ssd_descriptor.extent_id, false);
-        if (!report_result) {
-            LOG(ERROR) << "Failed to report SSD write failure for key=" << key
-                       << ", error=" << toString(report_result.error());
+        if (!success) {
+            LOG(ERROR) << "SSD async write exhausted retries for key=" << key
+                       << ", final_error=" << toString(last_io_err);
+            auto report_result = master_client_.ReportSsdWriteResult(
+                key, ssd_descriptor.extent_id, false, last_io_err);
+            if (!report_result) {
+                LOG(ERROR) << "Failed to report SSD write failure for key=" << key
+                           << ", error=" << toString(report_result.error());
+            }
         }
+
+        const int64_t prev_depth = static_cast<int64_t>(
+            ssd_async_sink_queue_depth_.fetch_sub(1, std::memory_order_relaxed));
+        const int64_t next_depth = prev_depth > 0 ? prev_depth - 1 : 0;
+        if (prev_depth <= 0) {
+            ssd_async_sink_queue_depth_.store(0, std::memory_order_relaxed);
+        }
+        MasterMetricManager::instance().set_ssd_async_sink_queue_depth(
+            next_depth);
     });
 }
 

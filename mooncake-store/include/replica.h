@@ -545,6 +545,12 @@ inline std::vector<std::optional<std::string>> Replica::get_segment_names()
         }
         return segment_names;
     }
+    if (is_ssd_pool_replica()) {
+        const auto& ssd_data = std::get<SsdExtentReplicaData>(data_);
+        if (!ssd_data.target_endpoint.empty()) {
+            return {ssd_data.target_endpoint};
+        }
+    }
     return std::vector<std::optional<std::string>>();
 }
 

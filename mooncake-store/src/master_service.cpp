@@ -1068,7 +1068,7 @@ tl::expected<SsdExtentDescriptor, ErrorCode> MasterService::AllocateSsdExtent(
 
 tl::expected<void, ErrorCode> MasterService::ReportSsdWriteResult(
     const UUID& client_id, const std::string& key, const std::string& extent_id,
-    bool success) {
+    bool success, ErrorCode error_code) {
     if (!extent_id.empty()) {
         ssd_pool_manager_.ReportExtentIoResult(extent_id, success);
     }
@@ -1076,6 +1076,10 @@ tl::expected<void, ErrorCode> MasterService::ReportSsdWriteResult(
     if (success) {
         return PutEnd(client_id, key, ReplicaType::SSD_POOL);
     }
+
+    LOG(WARNING) << "ssd_write_failed key=" << key
+                 << ", extent_id=" << extent_id
+                 << ", error_code=" << toString(error_code);
     auto revoke = PutRevoke(client_id, key, ReplicaType::SSD_POOL);
     if (!revoke.has_value() && revoke.error() != ErrorCode::OBJECT_NOT_FOUND) {
         LOG(WARNING) << "ssd_write_failed_revoke_failed key=" << key
@@ -1084,7 +1088,8 @@ tl::expected<void, ErrorCode> MasterService::ReportSsdWriteResult(
         return tl::make_unexpected(revoke.error());
     }
     VLOG(1) << "ssd_write_failed_revoke_done key=" << key
-            << ", extent_id=" << extent_id;
+            << ", extent_id=" << extent_id
+            << ", error_code=" << toString(error_code);
     return {};
 }
 

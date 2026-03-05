@@ -262,9 +262,11 @@ class MasterClient {
      * @param key Object key.
      * @param extent_id SSD extent id allocated by PutStart.
      * @param success true means SSD write completed; false means failed.
+     * @param error_code SSD I/O error code when success=false.
      */
     [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdWriteResult(
-        const std::string& key, const std::string& extent_id, bool success);
+        const std::string& key, const std::string& extent_id, bool success,
+        ErrorCode error_code);
 
     /**
      * @brief Pings master to check its availability

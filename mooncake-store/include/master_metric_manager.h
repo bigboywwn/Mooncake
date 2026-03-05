@@ -220,8 +220,12 @@ class MasterMetricManager {
     void inc_ssd_spdk_io_timeout_total(int64_t val = 1);
     void inc_ssd_spdk_io_fail_total(int64_t val = 1);
     void inc_ssd_connect_fail_total(int64_t val = 1);
+    void inc_ssd_queue_full_total(int64_t val = 1);
     void set_ssd_target_health(const std::string& target_endpoint,
                                double health);
+    void set_ssd_reactor_cpu_usage_pct(int64_t pct);
+    void set_ssd_async_sink_queue_depth(int64_t depth);
+    void set_ssd_async_sink_queue_lag_ms(int64_t lag_ms);
 
     // Eviction Metrics Getters
     int64_t get_eviction_success();
@@ -237,6 +241,10 @@ class MasterMetricManager {
     int64_t get_ssd_spdk_io_timeout_total();
     int64_t get_ssd_spdk_io_fail_total();
     int64_t get_ssd_connect_fail_total();
+    int64_t get_ssd_queue_full_total();
+    int64_t get_ssd_reactor_cpu_usage_pct();
+    int64_t get_ssd_async_sink_queue_depth();
+    int64_t get_ssd_async_sink_queue_lag_ms();
 
     // PutStart Discard Metrics
     void inc_put_start_discard_cnt(int64_t count, int64_t size);
@@ -449,7 +457,11 @@ class MasterMetricManager {
     ylt::metric::counter_t ssd_spdk_io_timeout_total_;
     ylt::metric::counter_t ssd_spdk_io_fail_total_;
     ylt::metric::counter_t ssd_connect_fail_total_;
+    ylt::metric::counter_t ssd_queue_full_total_;
     ylt::metric::dynamic_gauge_1t ssd_target_health_;
+    ylt::metric::gauge_t ssd_reactor_cpu_usage_pct_;
+    ylt::metric::gauge_t ssd_async_sink_queue_depth_;
+    ylt::metric::gauge_t ssd_async_sink_queue_lag_ms_;
 
     // PutStart Discard Metrics
     ylt::metric::counter_t put_start_discard_cnt_;

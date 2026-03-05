@@ -1,5 +1,6 @@
 #include "master_metric_manager.h"
 
+#include <algorithm>
 #include <glog/logging.h>
 #include <iomanip>  // For std::fixed, std::setprecision
 #include <sstream>  // For string building during serialization
@@ -261,8 +262,18 @@ MasterMetricManager::MasterMetricManager()
                               "Total number of SPDK SSD I/O failures"),
       ssd_connect_fail_total_("ssd_connect_fail_total",
                               "Total number of SSD target connect failures"),
+      ssd_queue_full_total_("ssd_queue_full_total",
+                            "Total number of SSD queue-full rejections"),
       ssd_target_health_("ssd_target_health",
                          "Current SSD target health status", {"target"}),
+      ssd_reactor_cpu_usage_pct_(
+          "ssd_reactor_cpu_usage_pct",
+          "Approximate CPU usage percentage of SPDK reactor execution path"),
+      ssd_async_sink_queue_depth_("ssd_async_sink_queue_depth",
+                                  "Current depth of async SSD sink queue"),
+      ssd_async_sink_queue_lag_ms_(
+          "ssd_async_sink_queue_lag_ms",
+          "Lag in milliseconds between SSD async sink enqueue and execution"),
 
       // Initialize Discarded Replicas Counters
       put_start_discard_cnt_("master_put_start_discard_cnt",
@@ -474,6 +485,10 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     ssd_spdk_io_timeout_total_.inc(0);
     ssd_spdk_io_fail_total_.inc(0);
     ssd_connect_fail_total_.inc(0);
+    ssd_queue_full_total_.inc(0);
+    ssd_reactor_cpu_usage_pct_.update(0);
+    ssd_async_sink_queue_depth_.update(0);
+    ssd_async_sink_queue_lag_ms_.update(0);
 
     // Update PutStart Discard Metrics
     put_start_discard_cnt_.inc(0);
@@ -1143,9 +1158,26 @@ void MasterMetricManager::inc_ssd_connect_fail_total(int64_t val) {
     ssd_connect_fail_total_.inc(val);
 }
 
+void MasterMetricManager::inc_ssd_queue_full_total(int64_t val) {
+    ssd_queue_full_total_.inc(val);
+}
+
 void MasterMetricManager::set_ssd_target_health(
     const std::string& target_endpoint, double health) {
     ssd_target_health_.update({target_endpoint}, health);
+}
+
+void MasterMetricManager::set_ssd_reactor_cpu_usage_pct(int64_t pct) {
+    const int64_t bounded = std::clamp<int64_t>(pct, 0, 100);
+    ssd_reactor_cpu_usage_pct_.update(bounded);
+}
+
+void MasterMetricManager::set_ssd_async_sink_queue_depth(int64_t depth) {
+    ssd_async_sink_queue_depth_.update(std::max<int64_t>(depth, 0));
+}
+
+void MasterMetricManager::set_ssd_async_sink_queue_lag_ms(int64_t lag_ms) {
+    ssd_async_sink_queue_lag_ms_.update(std::max<int64_t>(lag_ms, 0));
 }
 
 int64_t MasterMetricManager::get_eviction_success() {
@@ -1198,6 +1230,22 @@ int64_t MasterMetricManager::get_ssd_spdk_io_fail_total() {
 
 int64_t MasterMetricManager::get_ssd_connect_fail_total() {
     return ssd_connect_fail_total_.value();
+}
+
+int64_t MasterMetricManager::get_ssd_queue_full_total() {
+    return ssd_queue_full_total_.value();
+}
+
+int64_t MasterMetricManager::get_ssd_reactor_cpu_usage_pct() {
+    return ssd_reactor_cpu_usage_pct_.value();
+}
+
+int64_t MasterMetricManager::get_ssd_async_sink_queue_depth() {
+    return ssd_async_sink_queue_depth_.value();
+}
+
+int64_t MasterMetricManager::get_ssd_async_sink_queue_lag_ms() {
+    return ssd_async_sink_queue_lag_ms_.value();
 }
 
 // PutStart Discard Metrics Getters
@@ -1482,7 +1530,11 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(ssd_spdk_io_timeout_total_);
     serialize_metric(ssd_spdk_io_fail_total_);
     serialize_metric(ssd_connect_fail_total_);
+    serialize_metric(ssd_queue_full_total_);
     serialize_metric(ssd_target_health_);
+    serialize_metric(ssd_reactor_cpu_usage_pct_);
+    serialize_metric(ssd_async_sink_queue_depth_);
+    serialize_metric(ssd_async_sink_queue_lag_ms_);
 
     // Serialize PutStart Discard Metrics
     serialize_metric(put_start_discard_cnt_);
@@ -1676,6 +1728,10 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t ssd_evicted_key_count = ssd_evicted_key_count_.value();
     int64_t ssd_evicted_size = ssd_evicted_size_.value();
     int64_t ssd_extent_release_fail_total = ssd_extent_release_fail_total_.value();
+    int64_t ssd_queue_full_total = ssd_queue_full_total_.value();
+    int64_t ssd_reactor_cpu_usage_pct = ssd_reactor_cpu_usage_pct_.value();
+    int64_t ssd_async_sink_queue_depth = ssd_async_sink_queue_depth_.value();
+    int64_t ssd_async_sink_queue_lag_ms = ssd_async_sink_queue_lag_ms_.value();
 
     // Ping counters
     int64_t ping = ping_requests_.value();
@@ -1803,6 +1859,11 @@ std::string MasterMetricManager::get_summary_string() {
        << "keys=" << ssd_evicted_key_count << ", "
        << "size=" << byte_size_to_string(ssd_evicted_size) << ", "
        << "release_fail=" << ssd_extent_release_fail_total;
+    ss << " | SSD IO: "
+       << "queue_full=" << ssd_queue_full_total << ", "
+       << "reactor_cpu_pct=" << ssd_reactor_cpu_usage_pct << ", "
+       << "async_depth=" << ssd_async_sink_queue_depth << ", "
+       << "async_lag_ms=" << ssd_async_sink_queue_lag_ms;
 
     // Discard summary
     ss << " | Discard: "

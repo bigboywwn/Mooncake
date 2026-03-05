@@ -198,7 +198,12 @@ enum class ErrorCode : int32_t {
         -713,  ///< Replica does not reside in current node memory.
 
     // Transfer errors (Range: -800 to -899)
-    TRANSFER_FAIL = -800,  ///< Transfer operation failed.
+    TRANSFER_FAIL = -800,     ///< Transfer operation failed.
+    SSD_QUEUE_FULL = -801,    ///< SSD IO queue/inflight limit exceeded.
+    SSD_IO_TIMEOUT = -802,    ///< SSD IO timed out.
+    SSD_IO_SUBMIT_FAIL = -803,  ///< SSD IO submit/completion path failed.
+    SSD_IO_RETRY_EXHAUSTED =
+        -804,  ///< SSD async retry exhausted without success.
 
     // RPC errors (Range: -900 to -999)
     RPC_FAIL = -900,  ///< RPC operation failed.

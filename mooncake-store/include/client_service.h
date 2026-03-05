@@ -591,6 +591,7 @@ class Client {
 
     // Client persistent thread pool for async operations
     ThreadPool write_thread_pool_;
+    std::atomic<int64_t> ssd_async_sink_queue_depth_{0};
     std::shared_ptr<StorageBackend> storage_backend_;
 
     // For high availability

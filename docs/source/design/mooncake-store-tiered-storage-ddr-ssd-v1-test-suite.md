@@ -37,7 +37,7 @@
 | TC-B4-02 | 异步写失败回收闭环 | 注入 SSD 异步写失败 | 触发 `PutToSsdPool` 失败上报 | `PutRevoke(SSD_POOL)` 生效，无残留 PROCESSING | master metadata + log | DoD-B4 |
 | TC-SSDONLY-01 | SSD-only 单 key 可用 | `MC_DDR_POOL_ENABLED=0` + SSD 启用 | 单 key `Put/Get` | 成功且值一致 | 返回码 + 数据校验 | DoD-SSDONLY |
 | TC-SSDONLY-02 | SSD-only 批量可用 | 同上 | `BatchPut/BatchGet` | 全量成功，无静默错误 | 返回码 + 批量校验 | DoD-SSDONLY |
-| TC-OBS-01 | 关键指标可观测 | 完成上述读写/失败路径 | 拉取 metrics | `ssd_spdk_io_*`、`ssd_connect_fail_total`、`master_ssd_extent_release_fail_total` 有暴露且可变化 | metrics 抓取结果 | DoD-OBS |
+| TC-OBS-01 | 关键指标可观测 | 完成上述读写/失败路径 | 拉取 metrics | `ssd_spdk_io_*`、`ssd_connect_fail_total`、`master_ssd_extent_release_fail_total`、`ssd_queue_full_total`、`ssd_reactor_cpu_usage_pct`、`ssd_async_sink_queue_depth`、`ssd_async_sink_queue_lag_ms` 有暴露且可变化 | metrics 抓取结果 | DoD-OBS |
 | TC-BOUNDARY-01 | TE 边界约束 | 构造 SSD 读写请求 | 执行读写并检查日志 | SSD 请求不进入 `TransferSubmitter` SSD 分支 | transfer log/assert | DoD-BOUNDARY |
 
 ## 4. DoD 定义
@@ -56,13 +56,28 @@
 2. 再跑功能联调：`DDR+SSD` 与 `SSD-only` 两套配置。
 3. 最后跑门禁回归：覆盖 `BatchGet`、fail-fast、指标拉取。
 
-## 6. 当前实现态参考结果
+## 6. 当前实现态参考结果（2026-03-06，ubuntu-build）
 
 已完成的验证样例：
 
-1. `MasterServiceSSDTest.ConsistentHashSelectsStableTargetForSameKey`：PASS
-2. `MasterServiceSSDTest.ConsistentHashHonorsWeight`：PASS
-3. `MasterServiceSSDTest.BatchReplicaClearAllReleasesSsdExtent`：PASS
-4. `MasterServiceSSDTest.TieredConfigReflectsSsdOnlyWhenDdrDisabled`：PASS
+1. `master_service_ssd_test`：20/20 PASS（覆盖 B2/B3、SSD-only config、query priority、report/revoke）。
+2. `master_metrics_test`：5/5 PASS（覆盖新增 SSD 可观测指标更新与读取）。
+3. `client_integration_test`：14/14 PASS（覆盖 Batch 路径、SSD-only、fail-fast）。
+4. `SsdOnlyClientIntegrationTest.SsdOnlyPutGet`：PASS。
+5. `SsdOnlyClientIntegrationTest.SsdOnlyBatchPutBatchGet`：PASS。
+6. `ClientFailFastSsdTest.CreateFailsWhenSpdkEnabledWithoutReachableTarget`：PASS。
 
-说明：其余用例需要在完整联调环境（含 client/master 启停与故障注入）执行。
+说明：
+1. 本轮为功能与契约门禁，不含极限性能压测。
+2. `TC-B2-01` 的“重启前后稳定性”使用同 key 重复 `PutStart` + 重建服务验证；更大样本统计可作为后续性能专项脚本。
+
+## 7. 复现实验命令（与代码一致）
+
+1. 编译（SPDK on）：
+`cmake --build /Users/miaomili/Documents/Playground/MoonCake-personal/build-spdk --target mooncake_store mooncake_master mooncake_client clientctl master_service_ssd_test master_metrics_test client_integration_test -j3`
+2. 运行 `master_service_ssd_test`：
+`/Users/miaomili/Documents/Playground/MoonCake-personal/build-spdk/mooncake-store/tests/master_service_ssd_test`
+3. 运行 `master_metrics_test`：
+`/Users/miaomili/Documents/Playground/MoonCake-personal/build-spdk/mooncake-store/tests/master_metrics_test`
+4. 运行 `client_integration_test`（需 SPDK 动态库路径）：
+`LD_LIBRARY_PATH=/Users/miaomili/Documents/Playground/Mooncake/extern/spdk-23.01/build/lib:/Users/miaomili/Documents/Playground/Mooncake/extern/spdk-23.01/dpdk/build-tmp/lib:$LD_LIBRARY_PATH /Users/miaomili/Documents/Playground/MoonCake-personal/build-spdk/mooncake-store/tests/client_integration_test`

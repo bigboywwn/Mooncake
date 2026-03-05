@@ -70,6 +70,8 @@ class SsdIoEngine {
                                     std::string& session_key);
     ErrorCode ValidateIoRange(const SsdExtentDescriptor& extent,
                               uint64_t requested_bytes) const;
+    void UpdateReactorCpuUsageMetric(uint64_t cpu_time_ns,
+                                     uint64_t wall_time_ns) const;
 
     static std::string NormalizeEndpointPath(const std::string& endpoint);
     static uint64_t TotalBytes(std::span<const Slice> slices);

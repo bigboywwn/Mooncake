@@ -103,7 +103,7 @@ class WrappedMasterService {
 
     tl::expected<void, ErrorCode> ReportSsdWriteResult(
         const UUID& client_id, const std::string& key,
-        const std::string& extent_id, bool success);
+        const std::string& extent_id, bool success, ErrorCode error_code);
 
     tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
 

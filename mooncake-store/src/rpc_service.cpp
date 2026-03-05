@@ -924,17 +924,19 @@ WrappedMasterService::GetTieredStorageConfig() {
 
 tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdWriteResult(
     const UUID& client_id, const std::string& key,
-    const std::string& extent_id, bool success) {
+    const std::string& extent_id, bool success, ErrorCode error_code) {
     return execute_rpc(
         "ReportSsdWriteResult",
         [&] {
             return master_service_.ReportSsdWriteResult(client_id, key,
-                                                        extent_id, success);
+                                                        extent_id, success,
+                                                        error_code);
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
                              ", extent_id=", extent_id,
-                             ", success=", success);
+                             ", success=", success,
+                             ", error_code=", toString(error_code));
         },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
         [] { MasterMetricManager::instance().inc_put_end_failures(); });

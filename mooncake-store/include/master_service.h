@@ -217,7 +217,8 @@ class MasterService {
     tl::expected<void, ErrorCode> ReportSsdWriteResult(const UUID& client_id,
                                                        const std::string& key,
                                                        const std::string& extent_id,
-                                                       bool success);
+                                                       bool success,
+                                                       ErrorCode error_code);
 
     /**
      * @brief Revoke a put operation, replica_type indicates the type of

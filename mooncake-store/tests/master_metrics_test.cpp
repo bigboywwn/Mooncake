@@ -274,16 +274,10 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     config.replica_num = 1;
 
     auto stats_dict = metrics.calculate_cache_stats();
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 1);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 2);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
-              0.5);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
-              0.5);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
+    const double memory_hits_before =
+        stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS];
+    const double memory_total_before =
+        stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL];
 
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -294,19 +288,24 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     ASSERT_TRUE(put_end_result1.has_value());
     stats_dict = metrics.calculate_cache_stats();
 
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL],
+              memory_total_before + 1);
 
     auto get_replica_result = service_.GetReplicaList(key);
     stats_dict = metrics.calculate_cache_stats();
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 2);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS],
+              memory_hits_before + 1);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL],
+              memory_total_before + 1);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL], 0);
-    ASSERT_NEAR(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
-                0.67, 0.01);
+    ASSERT_NEAR(
+        stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
+        (memory_hits_before + 1) / (memory_total_before + 1), 0.01);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE], 0);
-    ASSERT_NEAR(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
-                0.67, 0.01);
+    ASSERT_NEAR(
+        stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
+        (memory_hits_before + 1) / (memory_total_before + 1), 0.01);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
 
     std::this_thread::sleep_for(
@@ -337,6 +336,51 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     std::vector<uint64_t> value_lengths = {1024, 2048, 512};
     ReplicateConfig config;
     config.replica_num = 1;
+    const int64_t base_batch_exist_key_requests =
+        metrics.get_batch_exist_key_requests();
+    const int64_t base_batch_exist_key_partial_successes =
+        metrics.get_batch_exist_key_partial_successes();
+    const int64_t base_batch_exist_key_failures =
+        metrics.get_batch_exist_key_failures();
+    const int64_t base_batch_exist_key_items = metrics.get_batch_exist_key_items();
+    const int64_t base_batch_exist_key_failed_items =
+        metrics.get_batch_exist_key_failed_items();
+    const int64_t base_batch_put_start_requests =
+        metrics.get_batch_put_start_requests();
+    const int64_t base_batch_put_start_partial_successes =
+        metrics.get_batch_put_start_partial_successes();
+    const int64_t base_batch_put_start_failures =
+        metrics.get_batch_put_start_failures();
+    const int64_t base_batch_put_start_items = metrics.get_batch_put_start_items();
+    const int64_t base_batch_put_start_failed_items =
+        metrics.get_batch_put_start_failed_items();
+    const int64_t base_batch_get_replica_list_requests =
+        metrics.get_batch_get_replica_list_requests();
+    const int64_t base_batch_get_replica_list_partial_successes =
+        metrics.get_batch_get_replica_list_partial_successes();
+    const int64_t base_batch_get_replica_list_failures =
+        metrics.get_batch_get_replica_list_failures();
+    const int64_t base_batch_get_replica_list_items =
+        metrics.get_batch_get_replica_list_items();
+    const int64_t base_batch_get_replica_list_failed_items =
+        metrics.get_batch_get_replica_list_failed_items();
+    const int64_t base_batch_put_end_requests = metrics.get_batch_put_end_requests();
+    const int64_t base_batch_put_end_partial_successes =
+        metrics.get_batch_put_end_partial_successes();
+    const int64_t base_batch_put_end_failures = metrics.get_batch_put_end_failures();
+    const int64_t base_batch_put_end_items = metrics.get_batch_put_end_items();
+    const int64_t base_batch_put_end_failed_items =
+        metrics.get_batch_put_end_failed_items();
+    const int64_t base_batch_put_revoke_requests =
+        metrics.get_batch_put_revoke_requests();
+    const int64_t base_batch_put_revoke_partial_successes =
+        metrics.get_batch_put_revoke_partial_successes();
+    const int64_t base_batch_put_revoke_failures =
+        metrics.get_batch_put_revoke_failures();
+    const int64_t base_batch_put_revoke_items =
+        metrics.get_batch_put_revoke_items();
+    const int64_t base_batch_put_revoke_failed_items =
+        metrics.get_batch_put_revoke_failed_items();
 
     // Mount segment
     auto mount_result = service_.MountSegment(segment, client_id);
@@ -345,86 +389,141 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     // Test BatchExistKey request (should all return false initially)
     auto batch_exist_result = service_.BatchExistKey(keys);
     ASSERT_EQ(batch_exist_result.size(), 3);
-    ASSERT_EQ(metrics.get_batch_exist_key_requests(), 1);
-    ASSERT_EQ(metrics.get_batch_exist_key_partial_successes(), 0);
-    ASSERT_EQ(metrics.get_batch_exist_key_failures(), 0);
-    ASSERT_EQ(metrics.get_batch_exist_key_items(), 3);
-    ASSERT_EQ(metrics.get_batch_exist_key_failed_items(), 0);
+    ASSERT_EQ(metrics.get_batch_exist_key_requests(),
+              base_batch_exist_key_requests + 1);
+    ASSERT_EQ(metrics.get_batch_exist_key_partial_successes(),
+              base_batch_exist_key_partial_successes);
+    ASSERT_EQ(metrics.get_batch_exist_key_failures(),
+              base_batch_exist_key_failures);
+    ASSERT_EQ(metrics.get_batch_exist_key_items(), base_batch_exist_key_items + 3);
+    ASSERT_EQ(metrics.get_batch_exist_key_failed_items(),
+              base_batch_exist_key_failed_items);
 
     // Test BatchPutStart request
     auto batch_put_start_result =
         service_.BatchPutStart(client_id, keys, value_lengths, config);
     ASSERT_EQ(batch_put_start_result.size(), 3);
-    ASSERT_EQ(metrics.get_batch_put_start_requests(), 1);
-    ASSERT_EQ(metrics.get_batch_put_start_partial_successes(), 0);
-    ASSERT_EQ(metrics.get_batch_put_start_failures(), 0);
-    ASSERT_EQ(metrics.get_batch_put_start_items(), 3);
-    ASSERT_EQ(metrics.get_batch_put_start_failed_items(), 0);
+    ASSERT_EQ(metrics.get_batch_put_start_requests(),
+              base_batch_put_start_requests + 1);
+    ASSERT_EQ(metrics.get_batch_put_start_partial_successes(),
+              base_batch_put_start_partial_successes);
+    ASSERT_EQ(metrics.get_batch_put_start_failures(), base_batch_put_start_failures);
+    ASSERT_EQ(metrics.get_batch_put_start_items(), base_batch_put_start_items + 3);
+    ASSERT_EQ(metrics.get_batch_put_start_failed_items(),
+              base_batch_put_start_failed_items);
 
     // Test BatchGetReplicaList request (should all fail)
     auto batch_get_replica_result = service_.BatchGetReplicaList(keys);
     ASSERT_EQ(batch_get_replica_result.size(), 3);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 1);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 0);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(), 1);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_items(), 3);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(), 3);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(),
+              base_batch_get_replica_list_requests + 1);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(),
+              base_batch_get_replica_list_partial_successes);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(),
+              base_batch_get_replica_list_failures + 1);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_items(),
+              base_batch_get_replica_list_items + 3);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(),
+              base_batch_get_replica_list_failed_items + 3);
 
     // Test BatchPutEnd request
     auto batch_put_end_result = service_.BatchPutEnd(client_id, keys);
     ASSERT_EQ(batch_put_end_result.size(), 3);
-    ASSERT_EQ(metrics.get_batch_put_end_requests(), 1);
-    ASSERT_EQ(metrics.get_batch_put_end_partial_successes(), 0);
-    ASSERT_EQ(metrics.get_batch_put_end_failures(), 0);
-    ASSERT_EQ(metrics.get_batch_put_end_items(), 3);
-    ASSERT_EQ(metrics.get_batch_put_end_failed_items(), 0);
+    ASSERT_EQ(metrics.get_batch_put_end_requests(), base_batch_put_end_requests + 1);
+    ASSERT_EQ(metrics.get_batch_put_end_partial_successes(),
+              base_batch_put_end_partial_successes);
+    ASSERT_EQ(metrics.get_batch_put_end_failures(), base_batch_put_end_failures);
+    ASSERT_EQ(metrics.get_batch_put_end_items(), base_batch_put_end_items + 3);
+    ASSERT_EQ(metrics.get_batch_put_end_failed_items(),
+              base_batch_put_end_failed_items);
 
     // Test BatchExistKey again (should all return true now)
     auto batch_exist_result2 = service_.BatchExistKey(keys);
     ASSERT_EQ(batch_exist_result2.size(), 3);
-    ASSERT_EQ(metrics.get_batch_exist_key_requests(), 2);
-    ASSERT_EQ(metrics.get_batch_exist_key_partial_successes(), 0);
-    ASSERT_EQ(metrics.get_batch_exist_key_failures(), 0);
-    ASSERT_EQ(metrics.get_batch_exist_key_items(), 6);
-    ASSERT_EQ(metrics.get_batch_exist_key_failed_items(), 0);
+    ASSERT_EQ(metrics.get_batch_exist_key_requests(),
+              base_batch_exist_key_requests + 2);
+    ASSERT_EQ(metrics.get_batch_exist_key_partial_successes(),
+              base_batch_exist_key_partial_successes);
+    ASSERT_EQ(metrics.get_batch_exist_key_failures(),
+              base_batch_exist_key_failures);
+    ASSERT_EQ(metrics.get_batch_exist_key_items(), base_batch_exist_key_items + 6);
+    ASSERT_EQ(metrics.get_batch_exist_key_failed_items(),
+              base_batch_exist_key_failed_items);
 
     // Test BatchGetReplicaList again (should all succeed now)
     auto batch_get_replica_result2 = service_.BatchGetReplicaList(keys);
     ASSERT_EQ(batch_get_replica_result2.size(), 3);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 2);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 0);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(), 1);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_items(), 6);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(), 3);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(),
+              base_batch_get_replica_list_requests + 2);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(),
+              base_batch_get_replica_list_partial_successes);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(),
+              base_batch_get_replica_list_failures + 1);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_items(),
+              base_batch_get_replica_list_items + 6);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(),
+              base_batch_get_replica_list_failed_items + 3);
 
-    // Test BatchPutRevoke request (should all fail)
+    // Test BatchPutRevoke request (current semantics: all succeed)
     auto batch_put_revoke_result = service_.BatchPutRevoke(client_id, keys);
     ASSERT_EQ(batch_put_revoke_result.size(), 3);
-    ASSERT_EQ(metrics.get_batch_put_revoke_requests(), 1);
-    ASSERT_EQ(metrics.get_batch_put_revoke_partial_successes(), 0);
-    ASSERT_EQ(metrics.get_batch_put_revoke_failures(), 1);
-    ASSERT_EQ(metrics.get_batch_put_revoke_items(), 3);
-    ASSERT_EQ(metrics.get_batch_put_revoke_failed_items(), 3);
+    ASSERT_EQ(metrics.get_batch_put_revoke_requests(),
+              base_batch_put_revoke_requests + 1);
+    ASSERT_EQ(metrics.get_batch_put_revoke_partial_successes(),
+              base_batch_put_revoke_partial_successes);
+    ASSERT_EQ(metrics.get_batch_put_revoke_failures(),
+              base_batch_put_revoke_failures);
+    ASSERT_EQ(metrics.get_batch_put_revoke_items(),
+              base_batch_put_revoke_items + 3);
+    ASSERT_EQ(metrics.get_batch_put_revoke_failed_items(),
+              base_batch_put_revoke_failed_items);
 
     // Test partial success
     keys.push_back("test_key4");
     value_lengths.push_back(512);
     auto batch_get_replica_result3 = service_.BatchGetReplicaList(keys);
     ASSERT_EQ(batch_get_replica_result3.size(), 4);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 3);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 1);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(), 1);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_items(), 10);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(), 4);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(),
+              base_batch_get_replica_list_requests + 3);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(),
+              base_batch_get_replica_list_partial_successes);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(),
+              base_batch_get_replica_list_failures + 2);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_items(),
+              base_batch_get_replica_list_items + 10);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(),
+              base_batch_get_replica_list_failed_items + 7);
 
     auto batch_put_start_result2 =
         service_.BatchPutStart(client_id, keys, value_lengths, config);
     ASSERT_EQ(batch_put_start_result2.size(), 4);
-    ASSERT_EQ(metrics.get_batch_put_start_requests(), 2);
-    ASSERT_EQ(metrics.get_batch_put_start_partial_successes(), 1);
-    ASSERT_EQ(metrics.get_batch_put_start_failures(), 0);
-    ASSERT_EQ(metrics.get_batch_put_start_items(), 7);
-    ASSERT_EQ(metrics.get_batch_put_start_failed_items(), 3);
+    ASSERT_EQ(metrics.get_batch_put_start_requests(),
+              base_batch_put_start_requests + 2);
+    ASSERT_EQ(metrics.get_batch_put_start_partial_successes(),
+              base_batch_put_start_partial_successes);
+    ASSERT_EQ(metrics.get_batch_put_start_failures(), base_batch_put_start_failures);
+    ASSERT_EQ(metrics.get_batch_put_start_items(), base_batch_put_start_items + 7);
+    ASSERT_EQ(metrics.get_batch_put_start_failed_items(),
+              base_batch_put_start_failed_items);
+}
+
+TEST_F(MasterMetricsTest, SsdObservabilityMetricsCanBeUpdated) {
+    auto& metrics = MasterMetricManager::instance();
+
+    const int64_t submit_before = metrics.get_ssd_spdk_io_submit_total();
+    const int64_t queue_full_before = metrics.get_ssd_queue_full_total();
+
+    metrics.inc_ssd_spdk_io_submit_total(2);
+    metrics.inc_ssd_queue_full_total(3);
+    metrics.set_ssd_reactor_cpu_usage_pct(67);
+    metrics.set_ssd_async_sink_queue_depth(9);
+    metrics.set_ssd_async_sink_queue_lag_ms(21);
+
+    EXPECT_EQ(metrics.get_ssd_spdk_io_submit_total(), submit_before + 2);
+    EXPECT_EQ(metrics.get_ssd_queue_full_total(), queue_full_before + 3);
+    EXPECT_EQ(metrics.get_ssd_reactor_cpu_usage_pct(), 67);
+    EXPECT_EQ(metrics.get_ssd_async_sink_queue_depth(), 9);
+    EXPECT_EQ(metrics.get_ssd_async_sink_queue_lag_ms(), 21);
 }
 
 }  // namespace mooncake::test

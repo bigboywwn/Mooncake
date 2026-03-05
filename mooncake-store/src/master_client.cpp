@@ -641,13 +641,15 @@ MasterClient::GetTieredStorageConfig() {
 }
 
 tl::expected<void, ErrorCode> MasterClient::ReportSsdWriteResult(
-    const std::string& key, const std::string& extent_id, bool success) {
+    const std::string& key, const std::string& extent_id, bool success,
+    ErrorCode error_code) {
     ScopedVLogTimer timer(1, "MasterClient::ReportSsdWriteResult");
     timer.LogRequest("key=", key, ", extent_id=", extent_id,
-                     ", success=", success);
+                     ", success=", success,
+                     ", error_code=", toString(error_code));
 
     auto result = invoke_rpc<&WrappedMasterService::ReportSsdWriteResult, void>(
-        client_id_, key, extent_id, success);
+        client_id_, key, extent_id, success, error_code);
     timer.LogResponseExpected(result);
     return result;
 }

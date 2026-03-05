@@ -2,6 +2,11 @@
 
 本文档用于团队共享：在 Linux 构建机/虚拟机上部署 `mooncake`，并验证客户端 `Put/Get`（含 Batch）基础功能。
 
+## 0. 执行规则（强约束）
+
+- 仅允许使用 `ubuntu-build` 虚拟机执行构建与联调。
+- 禁止使用 `ubuntu-test`（该实例保留给测试 agent）。
+
 ## 1. 适用范围
 
 - 项目目录：`/Users/miaomili/Documents/Playground/MoonCake-personal`

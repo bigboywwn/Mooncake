@@ -217,6 +217,91 @@ TEST_F(MasterServiceSSDTest, BatchReplicaClearAllReleasesSsdExtent) {
     EXPECT_TRUE(has_ssd);
 }
 
+TEST_F(MasterServiceSSDTest, BatchReplicaClearSegmentReleasesMatchingSsdExtent) {
+    ScopedEnvVar enabled("MC_SSD_POOL_ENABLED", "1");
+    ScopedEnvVar ddr_enabled("MC_DDR_POOL_ENABLED", "0");
+    ScopedEnvVar targets("MC_SSD_POOL_TARGETS", "10.10.35.1:4420");
+    ScopedEnvVar capacity("MC_SSD_POOL_CAPACITY_BYTES", "4096");
+    ScopedEnvVar block_size("MC_SSD_POOL_BLOCK_SIZE", "4096");
+
+    auto service = std::make_unique<MasterService>(
+        MasterServiceConfig::builder()
+            .set_root_fs_dir("")
+            .set_default_kv_lease_ttl(0)
+            .build());
+
+    UUID client_id = generate_uuid();
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto put_start = service->PutStart(client_id, "clear-seg-key", 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    std::string target_endpoint;
+    for (const auto& rep : put_start.value()) {
+        if (rep.is_ssd_pool_replica()) {
+            target_endpoint = rep.get_ssd_extent_descriptor().target_endpoint;
+            break;
+        }
+    }
+    ASSERT_FALSE(target_endpoint.empty());
+    ASSERT_TRUE(
+        service->PutEnd(client_id, "clear-seg-key", ReplicaType::SSD_POOL)
+            .has_value());
+
+    auto clear_result =
+        service->BatchReplicaClear({"clear-seg-key"}, client_id, target_endpoint);
+    ASSERT_TRUE(clear_result.has_value());
+    ASSERT_EQ(clear_result.value().size(), 1);
+
+    auto second = service->PutStart(client_id, "clear-seg-key-2", 1024, config);
+    ASSERT_TRUE(second.has_value());
+    bool has_ssd = false;
+    for (const auto& rep : second.value()) {
+        if (rep.is_ssd_pool_replica()) {
+            has_ssd = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_ssd);
+}
+
+TEST_F(MasterServiceSSDTest, ReportSsdWriteResultFailureRevokesProcessingReplica) {
+    ScopedEnvVar enabled("MC_SSD_POOL_ENABLED", "1");
+    ScopedEnvVar ddr_enabled("MC_DDR_POOL_ENABLED", "0");
+    ScopedEnvVar targets("MC_SSD_POOL_TARGETS", "10.10.36.1:4420");
+
+    auto service = std::make_unique<MasterService>(
+        MasterServiceConfig::builder()
+            .set_root_fs_dir("")
+            .set_default_kv_lease_ttl(0)
+            .build());
+
+    UUID client_id = generate_uuid();
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start =
+        service->PutStart(client_id, "ssd-report-fail-key", 2048, config);
+    ASSERT_TRUE(put_start.has_value());
+
+    std::string extent_id;
+    for (const auto& rep : put_start.value()) {
+        if (rep.is_ssd_pool_replica()) {
+            extent_id = rep.get_ssd_extent_descriptor().extent_id;
+            break;
+        }
+    }
+    ASSERT_FALSE(extent_id.empty());
+
+    auto report = service->ReportSsdWriteResult(client_id, "ssd-report-fail-key",
+                                                extent_id, false,
+                                                ErrorCode::SSD_IO_TIMEOUT);
+    ASSERT_TRUE(report.has_value());
+
+    auto list = service->GetReplicaList("ssd-report-fail-key");
+    ASSERT_FALSE(list.has_value());
+    EXPECT_EQ(list.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
 TEST_F(MasterServiceSSDTest, TieredConfigReflectsSsdOnlyWhenDdrDisabled) {
     ScopedEnvVar enabled("MC_SSD_POOL_ENABLED", "1");
     ScopedEnvVar ddr_enabled("MC_DDR_POOL_ENABLED", "0");
@@ -654,6 +739,7 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
     master_config.root_fs_dir = "/mnt/ssd";
     master_config.put_start_discard_timeout_sec = 3;
     master_config.put_start_release_timeout_sec = 5;
+    master_config.default_kv_lease_ttl = 15000;
     std::unique_ptr<MasterService> service_(new MasterService(master_config));
 
     constexpr size_t kReplicaCnt = 2;  // 1 memory replica + 1 disk replica
@@ -741,8 +827,8 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
             EXPECT_TRUE(get_result.value().replicas[0].is_disk_replica());
         }
 
-        // Wait for the key to expire.
-        for (size_t i = 0; i <= DEFAULT_DEFAULT_KV_LEASE_TTL / 1000; i++) {
+        // Wait for key lease expiry before RemoveAll to keep the next round clean.
+        for (size_t i = 0; i <= master_config.default_kv_lease_ttl / 1000; i++) {
             auto result = service_->Ping(client_id);
             EXPECT_TRUE(result.has_value());
             std::this_thread::sleep_for(std::chrono::seconds(1));

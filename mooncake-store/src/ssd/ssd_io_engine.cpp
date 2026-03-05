@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <time.h>
 
 #include <algorithm>
 #include <chrono>
@@ -143,7 +144,69 @@ bool EnsureSpdkSockPosixLoaded() {
     return loaded;
 }
 
+uint64_t GetThreadCpuTimeNs() {
+    timespec ts = {};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
+        return 0;
+    }
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL +
+           static_cast<uint64_t>(ts.tv_nsec);
+}
+
 #if defined(MOONCAKE_STORE_USE_SPDK) && MOONCAKE_STORE_USE_SPDK
+class SpdkRuntimeManager {
+   public:
+    static SpdkRuntimeManager& Instance() {
+        static SpdkRuntimeManager instance;
+        return instance;
+    }
+
+    bool Acquire(int mem_channel) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const int bounded_channel = std::max(mem_channel, 1);
+        if (ref_count_ > 0) {
+            if (mem_channel_ != bounded_channel) {
+                LOG(WARNING) << "SPDK runtime already initialized with mem_channel="
+                             << mem_channel_ << ", reuse for requested="
+                             << bounded_channel;
+            }
+            ++ref_count_;
+            return true;
+        }
+
+        spdk_env_opts opts;
+        spdk_env_opts_init(&opts);
+        opts.name = "mooncake-store-spdk";
+        opts.mem_channel = bounded_channel;
+        if (spdk_env_init(&opts) < 0) {
+            LOG(ERROR) << "spdk_env_init failed";
+            return false;
+        }
+        mem_channel_ = bounded_channel;
+        ref_count_ = 1;
+        return true;
+    }
+
+    void Release() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (ref_count_ <= 0) {
+            return;
+        }
+        --ref_count_;
+        if (ref_count_ == 0) {
+            spdk_env_fini();
+            mem_channel_ = 0;
+        }
+    }
+
+   private:
+    SpdkRuntimeManager() = default;
+
+    std::mutex mutex_;
+    int ref_count_{0};
+    int mem_channel_{0};
+};
+
 struct SpdkIoCompletion {
     std::atomic<bool> done{false};
     bool success{false};
@@ -164,15 +227,15 @@ ErrorCode WaitSpdkCompletion(spdk_nvme_qpair* qpair, SpdkIoCompletion& completio
     while (!completion.done.load(std::memory_order_acquire)) {
         const int rc = spdk_nvme_qpair_process_completions(qpair, 0);
         if (rc < 0) {
-            return ErrorCode::TRANSFER_FAIL;
+            return ErrorCode::SSD_IO_SUBMIT_FAIL;
         }
         if (std::chrono::steady_clock::now() > deadline) {
-            return ErrorCode::TRANSFER_FAIL;
+            return ErrorCode::SSD_IO_TIMEOUT;
         }
         std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
 
-    return completion.success ? ErrorCode::OK : ErrorCode::TRANSFER_FAIL;
+    return completion.success ? ErrorCode::OK : ErrorCode::SSD_IO_SUBMIT_FAIL;
 }
 #endif
 
@@ -192,7 +255,7 @@ struct SsdIoEngine::Impl {
         std::mutex io_mutex;
     };
 
-    bool spdk_env_ready{false};
+    bool spdk_runtime_acquired{false};
     std::unordered_map<std::string, std::unique_ptr<SpdkSession>> sessions;
 #endif
     std::vector<SsdIoTargetConfig> target_configs;
@@ -232,7 +295,7 @@ SsdIoEngine::SsdIoEngine(SsdIoEngineConfig config)
 
 SsdIoEngine::~SsdIoEngine() {
 #if defined(MOONCAKE_STORE_USE_SPDK) && MOONCAKE_STORE_USE_SPDK
-    if (!impl_ || !impl_->spdk_env_ready) {
+    if (!impl_ || !impl_->spdk_runtime_acquired) {
         return;
     }
 
@@ -251,8 +314,8 @@ SsdIoEngine::~SsdIoEngine() {
         }
     }
     impl_->sessions.clear();
-    spdk_env_fini();
-    impl_->spdk_env_ready = false;
+    SpdkRuntimeManager::Instance().Release();
+    impl_->spdk_runtime_acquired = false;
 #endif
 }
 
@@ -284,15 +347,11 @@ bool SsdIoEngine::Initialize() {
         return false;
     }
 
-    spdk_env_opts opts;
-    spdk_env_opts_init(&opts);
-    opts.name = "mooncake-store-spdk";
-    opts.mem_channel = std::max(1, config_.reactor_cores);
-    if (spdk_env_init(&opts) < 0) {
-        LOG(ERROR) << "spdk_env_init failed";
+    if (!SpdkRuntimeManager::Instance().Acquire(
+            std::max(1, config_.reactor_cores))) {
         return false;
     }
-    impl_->spdk_env_ready = true;
+    impl_->spdk_runtime_acquired = true;
 
     bool has_healthy_target = false;
     for (const auto& target : impl_->target_configs) {
@@ -314,6 +373,8 @@ bool SsdIoEngine::Initialize() {
     if (!has_healthy_target) {
         LOG(ERROR) << "All configured SPDK NVMeoF(TCP) targets are unavailable "
                       "(fail-fast)";
+        SpdkRuntimeManager::Instance().Release();
+        impl_->spdk_runtime_acquired = false;
         return false;
     }
 
@@ -332,10 +393,22 @@ ErrorCode SsdIoEngine::Write(const SsdExtentDescriptor& extent,
         inflight_io_.fetch_add(1, std::memory_order_relaxed);
     if (current_inflight >= config_.queue_limit) {
         inflight_io_.fetch_sub(1, std::memory_order_relaxed);
-        return ErrorCode::TRANSFER_FAIL;
+        MasterMetricManager::instance().inc_ssd_queue_full_total();
+        return ErrorCode::SSD_QUEUE_FULL;
     }
     InflightGuard guard(inflight_io_);
-    return DoWrite(extent, slices);
+    const auto wall_start = std::chrono::steady_clock::now();
+    const uint64_t cpu_start = GetThreadCpuTimeNs();
+    const ErrorCode result = DoWrite(extent, slices);
+    const uint64_t cpu_end = GetThreadCpuTimeNs();
+    const auto wall_end = std::chrono::steady_clock::now();
+    const uint64_t wall_ns =
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  wall_end - wall_start)
+                                  .count());
+    UpdateReactorCpuUsageMetric(cpu_end >= cpu_start ? (cpu_end - cpu_start) : 0,
+                                wall_ns);
+    return result;
 }
 
 ErrorCode SsdIoEngine::Read(const SsdExtentDescriptor& extent,
@@ -344,10 +417,22 @@ ErrorCode SsdIoEngine::Read(const SsdExtentDescriptor& extent,
         inflight_io_.fetch_add(1, std::memory_order_relaxed);
     if (current_inflight >= config_.queue_limit) {
         inflight_io_.fetch_sub(1, std::memory_order_relaxed);
-        return ErrorCode::TRANSFER_FAIL;
+        MasterMetricManager::instance().inc_ssd_queue_full_total();
+        return ErrorCode::SSD_QUEUE_FULL;
     }
     InflightGuard guard(inflight_io_);
-    return DoRead(extent, slices);
+    const auto wall_start = std::chrono::steady_clock::now();
+    const uint64_t cpu_start = GetThreadCpuTimeNs();
+    const ErrorCode result = DoRead(extent, slices);
+    const uint64_t cpu_end = GetThreadCpuTimeNs();
+    const auto wall_end = std::chrono::steady_clock::now();
+    const uint64_t wall_ns =
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  wall_end - wall_start)
+                                  .count());
+    UpdateReactorCpuUsageMetric(cpu_end >= cpu_start ? (cpu_end - cpu_start) : 0,
+                                wall_ns);
+    return result;
 }
 
 ErrorCode SsdIoEngine::DoWrite(const SsdExtentDescriptor& extent,
@@ -623,7 +708,7 @@ ErrorCode SsdIoEngine::DoSpdkWrite(const SsdExtentDescriptor& extent,
 #if !defined(MOONCAKE_STORE_USE_SPDK) || !MOONCAKE_STORE_USE_SPDK
     (void)extent;
     (void)slices;
-    return ErrorCode::TRANSFER_FAIL;
+    return ErrorCode::SSD_IO_SUBMIT_FAIL;
 #else
     const uint64_t requested_bytes = TotalBytes(slices);
     const uint64_t object_bytes =
@@ -640,7 +725,7 @@ ErrorCode SsdIoEngine::DoSpdkWrite(const SsdExtentDescriptor& extent,
 
     std::string session_key;
     if (!EnsureSpdkSessionForExtent(extent, session_key)) {
-        return ErrorCode::TRANSFER_FAIL;
+        return ErrorCode::SSD_IO_SUBMIT_FAIL;
     }
 
     Impl::SpdkSession* session = nullptr;
@@ -648,7 +733,7 @@ ErrorCode SsdIoEngine::DoSpdkWrite(const SsdExtentDescriptor& extent,
         std::lock_guard<std::mutex> lock(impl_->mutex);
         auto it = impl_->sessions.find(session_key);
         if (it == impl_->sessions.end()) {
-            return ErrorCode::TRANSFER_FAIL;
+            return ErrorCode::SSD_IO_SUBMIT_FAIL;
         }
         session = it->second.get();
     }
@@ -667,7 +752,7 @@ ErrorCode SsdIoEngine::DoSpdkWrite(const SsdExtentDescriptor& extent,
 
     void* dma_buf = spdk_dma_malloc(aligned_bytes, extent.block_size, nullptr);
     if (dma_buf == nullptr) {
-        return ErrorCode::TRANSFER_FAIL;
+        return ErrorCode::SSD_IO_SUBMIT_FAIL;
     }
 
     std::lock_guard<std::mutex> io_lock(session->io_mutex);
@@ -680,7 +765,7 @@ ErrorCode SsdIoEngine::DoSpdkWrite(const SsdExtentDescriptor& extent,
         if (read_rc != 0) {
             spdk_dma_free(dma_buf);
             MasterMetricManager::instance().inc_ssd_spdk_io_fail_total();
-            return ErrorCode::TRANSFER_FAIL;
+            return ErrorCode::SSD_IO_SUBMIT_FAIL;
         }
         const auto wait_rc = WaitSpdkCompletion(
             session->qpair, rmw_read_completion, config_.io_timeout_ms);
@@ -703,7 +788,7 @@ ErrorCode SsdIoEngine::DoSpdkWrite(const SsdExtentDescriptor& extent,
     if (write_rc != 0) {
         spdk_dma_free(dma_buf);
         MasterMetricManager::instance().inc_ssd_spdk_io_fail_total();
-        return ErrorCode::TRANSFER_FAIL;
+        return ErrorCode::SSD_IO_SUBMIT_FAIL;
     }
 
     const auto wait_rc =
@@ -723,7 +808,7 @@ ErrorCode SsdIoEngine::DoSpdkRead(const SsdExtentDescriptor& extent,
 #if !defined(MOONCAKE_STORE_USE_SPDK) || !MOONCAKE_STORE_USE_SPDK
     (void)extent;
     (void)slices;
-    return ErrorCode::TRANSFER_FAIL;
+    return ErrorCode::SSD_IO_SUBMIT_FAIL;
 #else
     const uint64_t requested_bytes = TotalBytes(slices);
     const uint64_t object_bytes =
@@ -740,7 +825,7 @@ ErrorCode SsdIoEngine::DoSpdkRead(const SsdExtentDescriptor& extent,
 
     std::string session_key;
     if (!EnsureSpdkSessionForExtent(extent, session_key)) {
-        return ErrorCode::TRANSFER_FAIL;
+        return ErrorCode::SSD_IO_SUBMIT_FAIL;
     }
 
     Impl::SpdkSession* session = nullptr;
@@ -748,7 +833,7 @@ ErrorCode SsdIoEngine::DoSpdkRead(const SsdExtentDescriptor& extent,
         std::lock_guard<std::mutex> lock(impl_->mutex);
         auto it = impl_->sessions.find(session_key);
         if (it == impl_->sessions.end()) {
-            return ErrorCode::TRANSFER_FAIL;
+            return ErrorCode::SSD_IO_SUBMIT_FAIL;
         }
         session = it->second.get();
     }
@@ -767,7 +852,7 @@ ErrorCode SsdIoEngine::DoSpdkRead(const SsdExtentDescriptor& extent,
 
     void* dma_buf = spdk_dma_malloc(aligned_bytes, extent.block_size, nullptr);
     if (dma_buf == nullptr) {
-        return ErrorCode::TRANSFER_FAIL;
+        return ErrorCode::SSD_IO_SUBMIT_FAIL;
     }
 
     std::lock_guard<std::mutex> io_lock(session->io_mutex);
@@ -779,7 +864,7 @@ ErrorCode SsdIoEngine::DoSpdkRead(const SsdExtentDescriptor& extent,
     if (read_rc != 0) {
         spdk_dma_free(dma_buf);
         MasterMetricManager::instance().inc_ssd_spdk_io_fail_total();
-        return ErrorCode::TRANSFER_FAIL;
+        return ErrorCode::SSD_IO_SUBMIT_FAIL;
     }
 
     const auto wait_rc =
@@ -814,6 +899,22 @@ ErrorCode SsdIoEngine::ValidateIoRange(const SsdExtentDescriptor& extent,
         return ErrorCode::INVALID_PARAMS;
     }
     return ErrorCode::OK;
+}
+
+void SsdIoEngine::UpdateReactorCpuUsageMetric(uint64_t cpu_time_ns,
+                                              uint64_t wall_time_ns) const {
+    if (wall_time_ns == 0) {
+        return;
+    }
+    const uint64_t cores = static_cast<uint64_t>(std::max(1, config_.reactor_cores));
+    const uint64_t denominator = wall_time_ns * cores;
+    if (denominator == 0) {
+        return;
+    }
+    const uint64_t pct = std::min<uint64_t>((cpu_time_ns * 100ULL) / denominator,
+                                            100ULL);
+    MasterMetricManager::instance().set_ssd_reactor_cpu_usage_pct(
+        static_cast<int64_t>(pct));
 }
 
 std::string SsdIoEngine::NormalizeEndpointPath(const std::string& endpoint) {
