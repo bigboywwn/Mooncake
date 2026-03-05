@@ -1,195 +1,276 @@
-# Mooncake Store V1 技术设计（审查闭环版）
+# Mooncake Store V1 技术设计（NVMeoF + SSD Pooling，As-Built）
 
-## 1. 设计目标
+## 0. 文档目的与版本
 
-本版本目标是将 `NVMeoF + SSD_POOL` 实现推进到可合并状态，并关闭审查阻塞项 `B1~B4`，同时纳入 `SSD-only` 运行能力。
+本文是 `ssd_tier` 分支当前实现的完整设计文档（As-Built），用于统一研发、测试、运维认知，避免“设计描述”与“实际代码行为”漂移。
 
-核心约束：
+- 代码基线：`origin/ssd_tier`（当前头部提交 `e8067f1`）
+- 设计范围：`mooncake-store` 内部 `DDR/SSD/remoteFS` 分层能力
+- 不在范围：`TE` 层 SSD 数据路径、V2 自动回退状态机、reactor 自动扩缩容
 
-1. 业务 API 不变：`Put/Get/Query/BatchQuery` 签名保持不变。
-2. SSD I/O 仅在 Store 层执行，`transfer-engine` 不参与 `SSD_POOL` 路径。
-3. 写确认点采用“最高可写层确认即返回”。
-4. `enabled_tiers` 必须反映真实运行态，而不是声明态。
+---
 
-## 2. 审查问题闭环（B1~B4）
+## 1. 目标与非目标
 
-### 2.1 B1：BatchGet 在 SSD 首副本场景失败
+### 1.1 目标
 
-问题：批量读路径原先直接走 `TransferSubmitter`，遇到 `SSD_POOL` 描述符会失败，且无降级。
+1. 在不变更业务 API（`Put/Get/Query/BatchQuery`）前提下，支持 `DDR/SSD/remoteFS` 分层。
+2. SSD 路径由 Store 直管：设备发现、空间分配、读写、释放、evict 闭环。
+3. 支持 `SSD-only`（`MC_DDR_POOL_ENABLED=0`, `MC_SSD_POOL_ENABLED=1`）可运行。
+4. 支持 `SPDK 23.01.x + NVMeoF(TCP)` 真实 target 对接，且 fail-fast。
 
-闭环决策：
+### 1.2 非目标
 
-1. 引入 `ReadWithFallback()`，复用单 key `Get` 的多副本降级读取语义。
-2. `BatchGet` 两段式执行：
-   - 段 A：仅 memory 首副本走批量 transfer 提交。
-   - 段 B：非 memory 首副本，或段 A 失败的 key，逐 key 回退 `ReadWithFallback()`。
-3. `BatchGetWhenPreferSameNode` 同步应用该降级策略。
+1. 不实现 V1 自动回退状态机（`auto_fallback_enabled` 仅兼容字段）。
+2. 不引入 TE 对 SSD 的转发/提交流程。
+3. 不实现 reactor 在线扩缩容与高级 QoS 调度。
 
-结果：批量读在 `DDR/SSD/remoteFS` 混合副本下保持正确性优先，不再出现 SSD 首副本即失败。
+---
 
-### 2.2 B2：策略声明是 consistent_hash，实现却是轮询
+## 2. 总体架构
 
-问题：`AllocateSsdExtent(policy=consistent_hash)` 名义一致性哈希，但实现使用 `rr_index_`。
+### 2.1 控制面（Master）
 
-闭环决策：
+- 核心组件：`MasterService` + `SSDPoolManager`
+- 职责：
+  - `GetTieredStorageConfig` 返回真实运行态 `enabled_tiers`
+  - `PutStart` 分配 `MEMORY`/`SSD_POOL`/`DISK` descriptor
+  - `PutEnd`/`PutRevoke` 维护对象副本状态机
+  - `BatchReplicaClear`/`Remove*`/`evict` 触发 SSD extent 释放
+  - `SSDPoolManager` 做 target 管理、hash 选路、extent 生命周期
 
-1. `SSDPoolManager` 替换为“加权一致性哈希环”。
-2. 哈希规则：
-   - key 哈希：`FNV-1a 64-bit`
-   - ring token：`SplitMix64(endpoint_hash ^ vnode_seed)`
-3. 虚拟节点规则：`vnodes = clamp(weight, 1, 64) * 128`。
-4. 选路规则：`lower_bound(hash(key))` 环形遍历，去重 target，按健康状态分层（`HEALTHY -> DEGRADED`）。
-5. `UNAVAILABLE` target 不参与分配。
+### 2.2 数据面（Client）
 
-结果：`policy=consistent_hash` 与真实分配算法一致，且支持权重表达能力。
+- 核心组件：`Client` + `SsdIoEngine`
+- 职责：
+  - 同步确认层选择：`SelectSyncAckReplicaType`
+  - 读路径降级：`ReadWithFallback`
+  - 批量读两段式：memory 批量 + non-memory 回退
+  - SSD 异步写完成后上报：`ReportSsdWriteResult`
 
-### 2.3 B3：BatchReplicaClear 路径未释放 SSD extent
+### 2.3 边界约束（TE）
 
-问题：清理 metadata 时存在“元数据删除但 extent 未释放”的容量泄漏风险。
+- `transfer_task.cpp` 明确禁止 SSD 路径进入 TE。
+- `submitSsdOperation` 仅返回失败并提示“Use store-layer SsdIoEngine for SSD_POOL I/O”。
 
-闭环决策：
+---
 
-1. `BatchReplicaClear(clear_all)` 在 `accessor.Erase()` 前调用 `ReleaseSsdReplicasForObject(...)`。
-2. `BatchReplicaClear(segment)` 删除命中的 `SSD_POOL` 副本时，逐条调用 `ReleaseExtent(extent_id, reason)`。
-3. 释放失败统一累计 `master_ssd_extent_release_fail_total`。
+## 3. 接口与类型契约
 
-结果：`PutRevoke/Remove/RemoveByRegex/RemoveAll/BatchReplicaClear` 均满足统一 extent 生命周期约束。
+### 3.1 对外 API（不变）
 
-### 2.4 B4：客户端启动未 fail-fast，异步写失败未闭环
+- `Put/Get/Query/BatchQuery` 签名不变。
 
-问题：
+### 3.2 对内扩展
 
-1. 获取 tiered config 失败时客户端仍继续启动。
-2. SSD 异步写失败时历史路径可能“跳过处理”。
+1. `ReplicaType`：包含 `SSD_POOL`。
+2. `SsdExtentDescriptor` 字段：
+   - `target_endpoint`
+   - `subsystem_nqn`
+   - `nsid`
+   - `block_size`
+   - `lba_start`
+   - `lba_count`
+   - `object_size`
+   - `extent_id`
+3. RPC：
+   - `GetTieredStorageConfig`
+   - `ReportSsdWriteResult`
 
-闭环决策：
+### 3.3 运行配置（关键）
 
-1. `InitSsdIoEngine()` 规则调整：
-   - 获取 `GetTieredStorageConfig` 失败：启动失败。
-   - `SSD` 启用且引擎初始化失败：启动失败（fail-fast）。
-2. 新增 `ReportSsdWriteResult` RPC 闭环（client -> rpc -> master）。
-3. 语义固定：
-   - `success=true`：`PutEnd(SSD_POOL)`
-   - `success=false`：`PutRevoke(SSD_POOL)` 并反馈 target health
-4. `PutToSsdPool` 不再“失败静默跳过”。
+1. Tier 开关：
+   - `MC_DDR_POOL_ENABLED`（默认 `true`）
+   - `MC_SSD_POOL_ENABLED`
+2. NVMeoF 客户端实现：
+   - `MC_NVMEOF_CLIENT_IMPL=spdk|legacy`
+3. SPDK 队列/超时：
+   - `MC_SSD_QUEUE_LIMIT`
+   - `MC_SSD_IO_TIMEOUT_MS`
+4. target 配置（推荐）：
+   - `MC_SSD_TARGETS_JSON`（每 target 独立配置）
+5. 兼容 fallback：
+   - `MC_SSD_POOL_TARGETS` + `MC_SSD_POOL_SUBSYSTEM_NQN` + `MC_SSD_POOL_NSID`
 
-结果：异步 SSD 写入状态可回收、可观测，不残留 `PROCESSING`。
+---
 
-## 3. Tier 语义与配置模型
+## 4. 分层语义（V1 锁定）
 
-## 3.1 Tier 开关与真实态返回
+### 4.1 读优先级
 
-新增环境变量：
+`DDR > SSD > remoteFS`
 
-1. `MC_DDR_POOL_ENABLED`（默认 `true`）
-2. `MC_SSD_POOL_ENABLED`
-3. `root_fs_dir` 非空时启用 `remoteFS`
+`Query` 接口不变，命中层由 descriptor 类型判定。
 
-`GetTieredStorageConfig.enabled_tiers` 按真实开关返回：
+### 4.2 写确认语义
 
-1. `DDR`：仅当 `MC_DDR_POOL_ENABLED=true`
-2. `SSD`：仅当 `MC_SSD_POOL_ENABLED=true` 且 SSDPoolManager 可用
-3. `remoteFS`：仅当 `root_fs_dir` 启用
+“最高可写层确认即返回”，通过 `SelectSyncAckReplicaType` 实现：
 
-## 3.2 `auto_fallback_enabled` 兼容语义
+1. `MEMORY` 可写：同步确认 `PutEnd(MEMORY)`，SSD/DISK 异步。
+2. `MEMORY` 不可写但 `SSD_POOL` 可写：同步写 SSD 并 `PutEnd(SSD_POOL)` 后返回。
+3. 仅 `DISK`：同步 `PutEnd(DISK)` 后返回。
 
-字段保留兼容，但 V1 不实现自动回退状态机：
+### 4.3 `PutStart` 语义
 
-1. 默认值为 `false`
-2. 若配置为 `true`，仅记录兼容日志，不改变实际行为
+SSD 可分配时可返回 `MEMORY + SSD_POOL` 双 descriptor；SSD 分配失败不阻塞 DDR 路径。
 
-## 4. 写路径语义（支持 SSD-only）
+---
 
-## 4.1 同步确认层选择
+## 5. 读写路径设计细节
 
-新增 `SelectSyncAckReplicaType(replicas)`：
+### 5.1 单 key 读
 
-1. 优先级：`MEMORY > SSD_POOL > DISK`
-2. 同步确认点固定为“最高可写层”
+`ReadWithFallback(key, query_result, slices)` 逐副本尝试，遇失败按层级继续降级。
 
-适配场景：
+### 5.2 Batch 读
 
-1. `DDR+SSD`：DDR 同步确认后返回，SSD 异步下沉。
-2. `SSD-only`：SSD 同步写 + `PutEnd(SSD_POOL)` 后返回。
-3. `DISK-only`：DISK 同步写 + `PutEnd(DISK)` 后返回。
+两段式策略：
 
-## 4.2 异步下沉规则
+1. 优先处理 memory 首副本（批量 submit）
+2. non-memory 或批量失败 key 回退到 `ReadWithFallback`
 
-仅处理“低于同步确认层”的副本：
+### 5.3 SSD 异步写结果闭环
 
-1. 同步层为 `MEMORY` 时，异步处理 `SSD_POOL`/`DISK`。
-2. 同步层为 `SSD_POOL` 时，仅异步处理 `DISK`。
-3. 同步层为 `DISK` 时，无异步下沉任务。
+`PutToSsdPool` 成功/失败都上报 `ReportSsdWriteResult`：
 
-## 4.3 批量写路径
+1. `success=true` -> `PutEnd(SSD_POOL)`
+2. `success=false` -> `PutRevoke(SSD_POOL)` + target health 反馈
 
-`BatchPut` 同步确认改为按 key 分组：
+---
 
-1. `MEMORY` 组：继续 `BatchPutEnd`。
-2. `SSD_POOL`/`DISK` 组：逐 key `PutEnd`。
-3. 失败清理按 key 的真实副本类型执行 `PutRevoke`，不再仅撤销 `MEMORY`。
+## 6. SSD 控制面与分配算法
 
-## 5. 读路径语义（Query 接口不变）
+### 6.1 target 健康状态
 
-## 5.1 优先级
+`HEALTHY / DEGRADED / UNAVAILABLE`
 
-仍为：`DDR > SSD > remoteFS`。
+- 分配优先 `HEALTHY`
+- `DEGRADED` 可降权使用
+- `UNAVAILABLE` 不参与分配
 
-## 5.2 降级策略
+### 6.2 一致性哈希（已替换轮询）
 
-1. 单 key：`Get(key, query_result, slices)` 已支持逐层降级读取。
-2. 批量：
-   - memory 首副本优先走批量 transfer；
-   - 非 memory 或 transfer 失败自动回退单 key 降级逻辑。
+`SSDPoolManager` 使用加权 hash ring：
 
-## 6. 数据模型与状态机
+1. key hash：`FNV-1a 64-bit`
+2. vnode：`clamp(weight,1,64) * 128`
+3. ring token：`SplitMix64(...)`
+4. 选路：`lower_bound(hash(key))` 环形扫描 + target 去重 + 健康过滤
 
-## 6.1 SSD extent
+---
 
-`SsdExtentDescriptor` 字段：
+## 7. SPDK 23.01.x 实现策略
 
-1. `target_endpoint`
-2. `subsystem_nqn`
-3. `nsid`
-4. `block_size`
-5. `lba_start`
-6. `lba_count`
-7. `object_size`
-8. `extent_id`
+### 7.1 构建闸门
 
-## 6.2 结果上报状态机
+`STORE_USE_SPDK` 默认 `OFF`。开启时要求：
 
-1. `PutStart` 分配 extent -> `PROCESSING`
-2. 异步写成功 -> `ReportSsdWriteResult(success=true)` -> `COMPLETE`
-3. 异步写失败 -> `ReportSsdWriteResult(success=false)` -> `PutRevoke(SSD_POOL)` -> 回收 extent
+1. `pkg-config` 可找到 `spdk_nvme` 和 `spdk_env_dpdk`
+2. 版本必须 `23.01.x`
+3. 否则 CMake 配置期直接失败
 
-## 7. 可观测性
+### 7.2 运行时 fail-fast
 
-门禁指标最小集合：
+当 `nvmeof_client_impl=spdk`：
+
+1. 未以 `STORE_USE_SPDK=ON` 编译 -> 启动失败
+2. target 全不可达 -> 启动失败
+3. 不自动降级到 file I/O
+
+### 7.3 I/O 路径
+
+- 写：`spdk_nvme_ns_cmd_write`
+- 读：`spdk_nvme_ns_cmd_read`
+- 支持 block 语义下的对齐处理与 `object_size` 截断
+- `queue_limit` / `io_timeout_ms` 在提交层生效
+
+---
+
+## 8. 生命周期与 Evict 闭环
+
+### 8.1 统一释放入口
+
+以下路径都收敛到 `ReleaseExtent`：
+
+1. `PutRevoke(SSD_POOL)`
+2. `Remove` / `RemoveByRegex` / `RemoveAll`
+3. `BatchReplicaClear(clear_all/segment)`
+4. `BatchEvictSsd`
+
+### 8.2 安全约束
+
+evict SSD 前必须检查“最后 `COMPLETE` 副本保护”：
+
+- 若该 SSD 副本是对象最后一个 `COMPLETE`，禁止回收。
+
+### 8.3 Evict 算法
+
+复用 DDR 两阶段 near-LRU：
+
+1. 第一阶段：非 soft-pin
+2. 第二阶段：按配置决定是否包含 soft-pin
+
+触发条件：`ssd_used_ratio` 高水位或 `ssd_need_eviction=true`。
+
+---
+
+## 9. 可观测性
+
+最小指标集合：
 
 1. `ssd_spdk_io_submit_total`
 2. `ssd_spdk_io_timeout_total`
 3. `ssd_spdk_io_fail_total`
 4. `ssd_connect_fail_total`
 5. `ssd_target_health{target}`
-6. `master_ssd_eviction_attempts`
-7. `master_ssd_eviction_success`
+6. `master_ssd_eviction_success`
+7. `master_ssd_eviction_attempts`
 8. `master_ssd_extent_release_fail_total`
 
-## 8. 回滚策略
+---
 
-1. 快速回滚：关闭 `MC_SSD_POOL_ENABLED`，系统回到 DDR/remoteFS。
-2. 关闭 DDR：`MC_DDR_POOL_ENABLED=0` 可验证 SSD-only 模式。
-3. 边界门禁：`transfer_task` 保持 `SSD_POOL` 禁入断言，防止回退到 TE 路径。
+## 10. Rollout 与 Rollback
 
-## 9. 实施检查清单（Implementation Checklist）
+### 10.1 灰度建议
 
-1. `GetTieredStorageConfig.enabled_tiers` 与运行态一致。
-2. `MC_DDR_POOL_ENABLED` 生效且默认兼容（true）。
-3. `BatchGet` 具备 SSD/non-memory 降级闭环。
-4. `SSDPoolManager` 使用加权 consistent hash ring，而非轮询。
-5. `BatchReplicaClear` 全路径释放 SSD extent。
-6. `InitSsdIoEngine` 与 tiered config 获取均为 fail-fast 语义。
-7. `ReportSsdWriteResult` RPC 全链路生效。
-8. `SSD-only` 下单 key 与 batch 读写可运行。
-9. 文档与实现同 PR 同步更新，无契约漂移。
+1. 先 `legacy` 验证语义闭环
+2. 再开 `spdk` + 单 target
+3. 最后扩展多 target 与权重策略
+
+### 10.2 快速回滚
+
+1. `MC_SSD_POOL_ENABLED=0` 回到 DDR/remoteFS
+2. 保持 API 不变，不影响上层业务调用
+
+---
+
+## 11. 当前验证结论（基于本轮提交）
+
+### 11.1 已验证通过
+
+1. `STORE_USE_SPDK=ON` 可编译。
+2. `SSD-only + SPDK` 手工 `Put/Get` 通过。
+3. target 侧 `bdev_get_iostat` 计数增长可证明 I/O 真实到达 NVMeoF target。
+
+### 11.2 当前已知缺口
+
+`client_integration_test` 在同进程多 client 场景下会触发：
+
+- `Invalid arguments to reinitialize SPDK env`
+- 根因：`spdk_env_init` 重复初始化缺少进程级单例/引用计数治理
+
+该问题不影响单 client 手工链路验证，但会阻塞多 client 自动化测试稳定性。
+
+---
+
+## 12. V1 实施清单（最终）
+
+1. `GetTieredStorageConfig.enabled_tiers` 必须是真实运行态。
+2. SSD 路径必须仅走 Store `SsdIoEngine`。
+3. `BatchGet` 必须具备 non-memory 回退闭环。
+4. `SSDPoolManager` 必须保持 consistent hash 实现，不得回退轮询。
+5. `BatchReplicaClear` 必须释放 SSD extent。
+6. `ReportSsdWriteResult` 必须覆盖成功与失败两条路径。
+7. `SSD-only` 必须可运行。
+8. SPDK fail-fast 语义必须保持。
+9. 多 client SPDK runtime 单例化问题需在后续修复并补回归。
