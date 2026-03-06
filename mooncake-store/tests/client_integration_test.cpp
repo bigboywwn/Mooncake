@@ -383,8 +383,16 @@ TEST_F(ClientIntegrationTest, RemoveOperation) {
         << "Put operation failed: " << toString(put_result.error());
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
-    // Remove the data
+    // Remove may race with async SSD PutEnd in DDR+SSD mode.
+    // Retry on REPLICA_IS_NOT_READY to wait for metadata convergence.
     auto remove_result = test_client_->Remove(key);
+    for (int i = 0; i < 50 && !remove_result.has_value(); ++i) {
+        if (remove_result.error() != ErrorCode::REPLICA_IS_NOT_READY) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        remove_result = test_client_->Remove(key);
+    }
     ASSERT_TRUE(remove_result.has_value())
         << "Remove operation failed: " << toString(remove_result.error());
 
@@ -1030,9 +1038,12 @@ static std::unordered_set<std::string> ExtractReplicaEndpoints(
                        .value())& q) {
     std::unordered_set<std::string> endpoints;
     for (const auto& r : q.replicas) {
-        // Memory replicas carry buffer_descriptor.transport_endpoint_
-        endpoints.insert(
-            r.get_memory_descriptor().buffer_descriptor.transport_endpoint_);
+        // COPY/MOVE segment assertions only rely on memory endpoints.
+        // In DDR+SSD mode query may also contain SSD/DISK replicas.
+        if (r.is_memory_replica()) {
+            endpoints.insert(
+                r.get_memory_descriptor().buffer_descriptor.transport_endpoint_);
+        }
     }
     return endpoints;
 }
@@ -1106,6 +1117,24 @@ TEST_F(ClientIntegrationTest, ReplicaCopyAndMoveOperations) {
     auto target_big = CreateClient(target_big_name);
     ASSERT_TRUE(target_big != nullptr);
 
+    auto create_copy_task_with_retry =
+        [&](const std::string& key, const std::vector<std::string>& targets,
+            int max_attempts = 8) -> tl::expected<UUID, ErrorCode> {
+        auto result =
+            tl::expected<UUID, ErrorCode>(tl::unexpected(ErrorCode::INTERNAL_ERROR));
+        for (int i = 0; i < max_attempts; ++i) {
+            result = test_client_->CreateCopyTask(key, targets);
+            if (result.has_value()) {
+                return result;
+            }
+            if (result.error() != ErrorCode::INTERNAL_ERROR) {
+                return result;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return result;
+    };
+
     // Mount segments for the extra clients
     constexpr size_t kSegAlign = 16 * 1024 * 1024;  // 16MB alignment
     const size_t kSmallSeg = kSegAlign;             // 16MB
@@ -1154,7 +1183,7 @@ TEST_F(ClientIntegrationTest, ReplicaCopyAndMoveOperations) {
 
         // Start COPY task to the full small target.
         auto copy_task =
-            test_client_->CreateCopyTask(source_key, {target_small_name});
+            create_copy_task_with_retry(source_key, {target_small_name});
         ASSERT_TRUE(copy_task.has_value())
             << "CreateCopyTask failed: " << toString(copy_task.error());
         const auto copy_task_id = copy_task.value();
@@ -1203,7 +1232,7 @@ TEST_F(ClientIntegrationTest, ReplicaCopyAndMoveOperations) {
             << "Put(source) failed: " << toString(put_res.error());
 
         auto copy_task =
-            test_client_->CreateCopyTask(source_key, {target_small_name});
+            create_copy_task_with_retry(source_key, {target_small_name});
         ASSERT_TRUE(copy_task.has_value())
             << "CreateCopyTask failed: " << toString(copy_task.error());
         const auto copy_task_id = copy_task.value();
@@ -1251,7 +1280,7 @@ TEST_F(ClientIntegrationTest, ReplicaCopyAndMoveOperations) {
 
         copy_task_ids.reserve(keys.size());
         for (const auto& key : keys) {
-            auto t = test_client_->CreateCopyTask(key, {target_big_name});
+            auto t = create_copy_task_with_retry(key, {target_big_name});
             ASSERT_TRUE(t.has_value())
                 << "CreateCopyTask failed: " << toString(t.error());
             copy_task_ids.push_back(t.value());

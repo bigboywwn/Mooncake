@@ -9,6 +9,13 @@
 - 开发角色自测试边界：仅执行 `gtest` 用例与 `e2e put/get` 冒烟验证（含 batch 基础路径）。
 - 性能压测、长稳测试、复杂故障注入不属于开发自测试范围，交由测试 agent 或专项测试流程执行。
 
+### 0.1 测试角色规则（2026-03-06，最高优先级）
+
+- 不再新增任何 `legacy target` 测试用例。
+- 测试角色不执行 `gtest` 用例。
+- 测试角色仅执行 `e2e` 测试，且必须基于真实部署的 `master/client/store` 服务。
+- 若本文件其他条目与本小节冲突，以本小节为准。
+
 ## 1. 适用范围
 
 - 项目目录：`/Users/miaomili/Documents/Playground/MoonCake-personal`
@@ -78,7 +85,9 @@ EOF
 - `Successfully put value for key: k1`
 - `Get value: hello_mooncake`
 
-## 5. E2E 自动化验证（gtest）
+## 5. 开发自测（gtest，仅开发角色）
+
+说明：本节仅供开发自测使用；测试角色禁止执行本节命令，按 `0.1` 执行真实部署 `e2e` 测试。
 
 ### 5.1 单 key Put/Get
 

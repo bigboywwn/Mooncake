@@ -31,10 +31,12 @@
 | TC-B1-02 | BatchGet memory 失败后降级 | 人工制造 memory 读失败 | 执行 `BatchGet` | 自动回退到 SSD/remoteFS，返回成功 | client log + fallback trace | DoD-B1 |
 | TC-B2-01 | 同 key 选路稳定 | 多 target，consistent hash 启用 | 重启前后重复 `PutStart` 同 key | `target_endpoint` 稳定 | `PutStart` 返回值 | DoD-B2 |
 | TC-B2-02 | 权重生效 | target weight 不同 | 多 key 分配统计 | 分布近似权重比例，重权重 target 命中更多 | 分配统计日志/脚本输出 | DoD-B2 |
+| TC-B2-03 | 三 target 场景可运行 | `MC_SSD_POOL_TARGETS=file://...` 配置 3 个内存盘 target | 执行 `client_integration_test` | 日志出现 `SSDPoolManager initialized, targets=3`，核心用例可执行 | client log | DoD-B2 |
 | TC-B3-01 | clear_all 释放闭环 | 小容量 SSD 池 | `PutStart/PutEnd` 后 `BatchReplicaClear(clear_all)` | extent 可复用，后续分配成功 | master log + 后续 PutStart | DoD-B3 |
 | TC-B3-02 | segment 清理释放精确 | 指定 segment 清理 | `BatchReplicaClear(segment)` | 仅命中副本释放，账本不泄漏 | master log + metric | DoD-B3 |
 | TC-B4-01 | fail-fast 启动语义 | SSD tier 启用且 SsdIoEngine 初始化失败 | 启动 client | 启动失败，不允许静默继续 | 启动日志 + 退出码 | DoD-B4 |
 | TC-B4-02 | 异步写失败回收闭环 | 注入 SSD 异步写失败 | 触发 `PutToSsdPool` 失败上报 | `PutRevoke(SSD_POOL)` 生效，无残留 PROCESSING | master metadata + log | DoD-B4 |
+| TC-B4-03 | SPDK 多 client 初始化稳定性 | `MC_NVMEOF_CLIENT_IMPL=spdk`，同进程创建多个 client | 重复初始化/销毁 client | 无 `spdk_env_init` 重入崩溃，失败可判定 | client log + 退出码 | DoD-B4 |
 | TC-SSDONLY-01 | SSD-only 单 key 可用 | `MC_DDR_POOL_ENABLED=0` + SSD 启用 | 单 key `Put/Get` | 成功且值一致 | 返回码 + 数据校验 | DoD-SSDONLY |
 | TC-SSDONLY-02 | SSD-only 批量可用 | 同上 | `BatchPut/BatchGet` | 全量成功，无静默错误 | 返回码 + 批量校验 | DoD-SSDONLY |
 | TC-OBS-01 | 关键指标可观测 | 完成上述读写/失败路径 | 拉取 metrics | `ssd_spdk_io_*`、`ssd_connect_fail_total`、`master_ssd_extent_release_fail_total`、`ssd_queue_full_total`、`ssd_reactor_cpu_usage_pct`、`ssd_async_sink_queue_depth`、`ssd_async_sink_queue_lag_ms` 有暴露且可变化 | metrics 抓取结果 | DoD-OBS |
@@ -54,22 +56,26 @@
 
 1. 先跑单测：`master_service_ssd_test`（B2/B3 基线）。
 2. 再跑功能联调：`DDR+SSD` 与 `SSD-only` 两套配置。
-3. 最后跑门禁回归：覆盖 `BatchGet`、fail-fast、指标拉取。
+3. 加跑 3-target 专项：使用内存盘 `file://` 目标验证 `targets=3` 初始化和稳定性。
+4. 最后跑门禁回归：覆盖 `BatchGet`、fail-fast、指标拉取。
 
-## 6. 当前实现态参考结果（2026-03-06，ubuntu-build）
+## 6. 当前实现态参考结果（2026-03-06，ubuntu-test）
 
 已完成的验证样例：
 
-1. `master_service_ssd_test`：20/20 PASS（覆盖 B2/B3、SSD-only config、query priority、report/revoke）。
-2. `master_metrics_test`：5/5 PASS（覆盖新增 SSD 可观测指标更新与读取）。
-3. `client_integration_test`：14/14 PASS（覆盖 Batch 路径、SSD-only、fail-fast）。
-4. `SsdOnlyClientIntegrationTest.SsdOnlyPutGet`：PASS。
-5. `SsdOnlyClientIntegrationTest.SsdOnlyBatchPutBatchGet`：PASS。
-6. `ClientFailFastSsdTest.CreateFailsWhenSpdkEnabledWithoutReachableTarget`：PASS。
+1. 基线（默认环境）：
+   - `master_service_ssd_test`：20/20 PASS。
+   - `master_metrics_test`：5/5 PASS。
+   - `client_integration_test`：15/15 PASS。
+2. 3-target 专项（`MC_SSD_POOL_TARGETS=file:///dev/shm/...` 三个内存盘）：
+   - `client_integration_test`：15 tests, 2 FAILED。
+   - 失败项：`ClientIntegrationTest.RemoveOperation`、`ClientIntegrationTest.ReplicaCopyAndMoveOperations`。
+   - 生效证据：日志命中 `SSDPoolManager initialized, targets=3`。
 
 说明：
 1. 本轮为功能与契约门禁，不含极限性能压测。
 2. `TC-B2-01` 的“重启前后稳定性”使用同 key 重复 `PutStart` + 重建服务验证；更大样本统计可作为后续性能专项脚本。
+3. 3-target 专项暴露了当前代码在部分集成用例上的兼容性问题，需单独跟踪修复后回归。
 
 ## 7. 复现实验命令（与代码一致）
 
@@ -81,3 +87,5 @@
 `/Users/miaomili/Documents/Playground/MoonCake-personal/build-spdk/mooncake-store/tests/master_metrics_test`
 4. 运行 `client_integration_test`（需 SPDK 动态库路径）：
 `LD_LIBRARY_PATH=/Users/miaomili/Documents/Playground/Mooncake/extern/spdk-23.01/build/lib:/Users/miaomili/Documents/Playground/Mooncake/extern/spdk-23.01/dpdk/build-tmp/lib:$LD_LIBRARY_PATH /Users/miaomili/Documents/Playground/MoonCake-personal/build-spdk/mooncake-store/tests/client_integration_test`
+5. 运行 3-target 内存盘专项（legacy）：
+`truncate -s 256M /dev/shm/mc-nvme-target-0.img && truncate -s 256M /dev/shm/mc-nvme-target-1.img && truncate -s 256M /dev/shm/mc-nvme-target-2.img && MC_DDR_POOL_ENABLED=1 MC_SSD_POOL_ENABLED=1 MC_NVMEOF_CLIENT_IMPL=legacy MC_SSD_POOL_TARGETS=file:///dev/shm/mc-nvme-target-0.img,file:///dev/shm/mc-nvme-target-1.img,file:///dev/shm/mc-nvme-target-2.img MC_SSD_POOL_CAPACITY_BYTES=268435456 MC_SSD_POOL_BLOCK_SIZE=4096 /Users/miaomili/Documents/Playground/MoonCake-personal/build-e2e/mooncake-store/tests/client_integration_test`
