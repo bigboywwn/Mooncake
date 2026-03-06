@@ -1,282 +1,131 @@
-# Mooncake 部署与 E2E 验证手册
+# Mooncake 部署与 E2E 执行手册（SPDK-Only）
 
-本文档用于团队共享：在 Linux 构建机/虚拟机上部署 `mooncake`，并验证客户端 `Put/Get`（含 Batch）基础功能。
-
-## 0. 执行规则（强约束）
+## 0. 执行规则（最高优先级）
 
 - 仅允许使用 `ubuntu-build` 虚拟机执行构建与联调。
 - 禁止使用 `ubuntu-test`（该实例保留给测试 agent）。
-- 开发角色自测试边界：仅执行 `gtest` 用例与 `e2e put/get` 冒烟验证（含 batch 基础路径）。
-- 性能压测、长稳测试、复杂故障注入不属于开发自测试范围，交由测试 agent 或专项测试流程执行。
-
-### 0.1 测试角色规则（2026-03-06，最高优先级）
-
-- 不再新增任何 `legacy target` 测试用例。
-- 测试角色不执行 `gtest` 用例。
-- 测试角色仅执行 `e2e` 测试，且必须基于真实部署的 `master/client/store` 服务。
-- 若本文件其他条目与本小节冲突，以本小节为准。
+- 测试角色仅执行真实环境 `e2e` 测试。
+- 测试角色不执行 `gtest`。
+- 不新增、不执行任何 `legacy target` 测试用例。
+- SSD 场景固定 `MC_NVMEOF_CLIENT_IMPL=spdk` + 3 target。
+- 若本文件其他条目与本节冲突，以本节为准。
 
 ## 1. 适用范围
 
 - 项目目录：`/Users/miaomili/Documents/Playground/MoonCake-personal`
-- 目标：验证 `mooncake_master + client` 基础读写链路
-- 当前推荐环境：Linux（macOS 直接运行 Linux 二进制会报 `exec format error`）
+- 目标：执行 `SPDK-only` 的真实环境 E2E 回归（`T1~T7`）
+- 当前推荐环境：Linux VM（macOS 直接运行 Linux 二进制会报 `exec format error`）
 
-## 2. 部署前置
+## 2. 快速准备
 
-1. 进入 Linux VM（示例）：
+1. 登录 VM：
 
 ```bash
 ssh -F ~/.lima/ubuntu-build/ssh.config -o User=root -o ControlMaster=no -o ControlPath=none lima-ubuntu-build
 ```
 
-2. 进入项目目录：
+2. 切到项目目录：
 
 ```bash
 cd /Users/miaomili/Documents/Playground/MoonCake-personal
 ```
 
-3. 编译最小运行与测试目标：
+3. 编译（固定 `-j3`）：
 
 ```bash
-cmake --build build-remerge --target mooncake_master mooncake_client clientctl client_integration_test -j3
+cmake --build build-spdk \
+  --target mooncake_master mooncake_client clientctl tiered_e2e_runner \
+  -j3
 ```
 
-## 3. 最小部署（Master）
-
-启动 master（后台）：
+## 3. SPDK 3-target 初始化
 
 ```bash
-pkill -f mooncake_master || true
-rm -f /tmp/mooncake_master.log
-./build-remerge/mooncake-store/src/mooncake_master \
-  --rpc_port=50051 \
-  --rpc_thread_num=2 \
-  --enable_ha=false \
-  --enable_http_metadata_server=false \
-  > /tmp/mooncake_master.log 2>&1 &
+./mooncake-store/tests/e2e/scripts/setup_spdk_ram_targets.sh --print-json
 ```
 
-健康检查：
+该命令会：
+
+- 启动（或复用）`spdk_tgt`
+- 创建 3 个内存 target（端口 `4420/4421/4422`）
+- 输出可直接使用的 `MC_SSD_TARGETS_JSON`
+
+## 4. 矩阵执行（T1~T7）
+
+统一入口：
 
 ```bash
-nc -z 127.0.0.1 50051
+./mooncake-store/tests/e2e/scripts/run_realenv_matrix.sh
 ```
 
-## 4. E2E 手工验证（clientctl）
+默认行为：
 
-执行 `create -> mount -> put -> get`：
+- 自动按 `T1 -> T7` 执行 `TC-CFG-01/TC-RW-01/TC-RW-02`
+- remoteFS 组合执行 `TC-RFS-01`
+- SSD 组合执行 `TC-SPDK-01/TC-SPDK-02`
+- 额外执行 `TC-SPDK-03` fail-fast 场景
+- 输出统一报告到 `artifacts/e2e-spdk-realenv-<sha>-<ts>/`
+
+## 5. 单用例执行（tiered_e2e_runner）
 
 ```bash
-cat <<'EOF' | ./build-remerge/mooncake-store/tests/e2e/clientctl \
-  --master_server_entry=127.0.0.1:50051 \
-  --engine_meta_url=P2PHANDSHAKE \
-  --protocol=tcp
-create c1 51001
-mount c1 seg1 67108864
-put c1 k1 hello_mooncake
-get c1 k1
-terminate
-EOF
+./build-spdk/mooncake-store/tests/e2e/tiered_e2e_runner \
+  --case TC-CFG-01 \
+  --master 127.0.0.1:50051 \
+  --metadata P2PHANDSHAKE \
+  --protocol tcp \
+  --expect-tiers DDR,SSD \
+  --expect-impl spdk
 ```
 
-预期输出包含：
+支持用例：
 
-- `Successfully put value for key: k1`
-- `Get value: hello_mooncake`
+- `TC-CFG-01`
+- `TC-RW-01`
+- `TC-RW-02`
+- `TC-RFS-01`
+- `TC-SPDK-01`
+- `TC-SPDK-02`
+- `TC-SPDK-03`
 
-## 5. 开发自测（gtest，仅开发角色）
+## 6. 报告与产物
 
-说明：本节仅供开发自测使用；测试角色禁止执行本节命令，按 `0.1` 执行真实部署 `e2e` 测试。
+产物目录：
 
-### 5.1 单 key Put/Get
+- `artifacts/e2e-spdk-realenv-<sha>-<ts>/summary.csv`
+- `artifacts/e2e-spdk-realenv-<sha>-<ts>/E2E_TEST_REPORT.md`
+- `artifacts/e2e-spdk-realenv-<sha>-<ts>/logs`
+- `artifacts/e2e-spdk-realenv-<sha>-<ts>/metrics`
+- `artifacts/e2e-spdk-realenv-<sha>-<ts>/env`
 
-```bash
-./build-remerge/mooncake-store/tests/client_integration_test \
-  --gtest_filter=ClientIntegrationTest.BasicPutGetOperations
-```
+## 7. 配置总表（测试视角）
 
-### 5.2 BatchPut/BatchGet
+| 变量名 | 默认值 | 生效侧 | 说明 |
+|---|---|---|---|
+| `MC_DDR_POOL_ENABLED` | `true` | master | DDR tier 开关 |
+| `MC_SSD_POOL_ENABLED` | `false` | master | SSD tier 开关 |
+| `MC_NVMEOF_CLIENT_IMPL` | `spdk` | master/client | 测试固定为 `spdk` |
+| `MC_SPDK_REACTOR_CORES` | `1` | master | reactor 核数（钳制 `[1,6]`） |
+| `MC_SSD_QUEUE_LIMIT` | `1024` | master/client | SSD 队列上限 |
+| `MC_SSD_IO_TIMEOUT_MS` | `5000` | master/client | SSD IO 超时 |
+| `MC_SSD_TARGETS_JSON` | 空 | master/client | SSD target 配置（推荐且测试必填） |
 
-```bash
-./build-remerge/mooncake-store/tests/client_integration_test \
-  --gtest_filter=ClientIntegrationTest.BatchPutGetOperations
-```
+注意：`MC_SSD_POOL_TARGETS`/`legacy` 相关配置在测试策略中不再使用。
 
-通过标准：测试进程退出码为 `0`，且无 `FAILED` 用例。
+## 8. 故障排查
 
-## 6. 常用清理
-
-停止 master：
-
-```bash
-pkill -f mooncake_master || true
-```
-
-查看日志：
-
-```bash
-tail -n 200 /tmp/mooncake_master.log
-```
-
-## 7. 故障排查速查
-
-1. `exec format error`：
+1. `exec format error`
 - 原因：在 macOS 直接运行 Linux 二进制。
-- 处理：切到 Linux VM 执行。
+- 处理：切换到 Linux VM。
 
-2. `clientctl` 创建客户端失败：
-- 检查 `mooncake_master` 是否在 `127.0.0.1:50051` 监听。
-- 检查参数 `--master_server_entry` 是否一致。
+2. `tiered_e2e_runner` 启动失败
+- 检查 `mooncake_master` 是否监听 `127.0.0.1:50051`。
+- 检查 `--master` 参数与 master 一致。
 
-3. `put/get` 失败：
-- 检查是否已先执行 `mount`。
-- 查看 `/tmp/mooncake_master.log` 与 client 输出中的错误码。
+3. SSD 场景 fail-fast
+- 检查是否以 `STORE_USE_SPDK=ON` 构建。
+- 检查 `MC_SSD_TARGETS_JSON` 是否可达且与 target 配置一致。
 
-## 8. SSD-only 专项验证（模板 + 一键执行）
-
-目标：验证 `enabled_tiers={SSD}` 下客户端 `Put/Get` 与 `BatchPut/BatchGet` 可用。
-
-### 8.1 环境变量模板（legacy，推荐先跑）
-
-```bash
-export MC_DDR_POOL_ENABLED=0
-export MC_SSD_POOL_ENABLED=1
-export MC_NVMEOF_CLIENT_IMPL=legacy
-export MC_SSD_POOL_TARGETS=file:///tmp/mooncake-ssd-only.bin
-export MC_SSD_POOL_CAPACITY_BYTES=$((8 * 1024 * 1024 * 1024))
-export MC_SSD_POOL_BLOCK_SIZE=4096
-export MC_SSD_QUEUE_LIMIT=1024
-export MC_SSD_IO_TIMEOUT_MS=5000
-```
-
-说明：`legacy` 模式用于功能验证，不依赖真实 NVMeoF target。
-
-### 8.2 环境变量模板（SPDK 23.01 + TCP target）
-
-```bash
-export MC_DDR_POOL_ENABLED=0
-export MC_SSD_POOL_ENABLED=1
-export MC_NVMEOF_CLIENT_IMPL=spdk
-export MC_SSD_QUEUE_LIMIT=1024
-export MC_SSD_IO_TIMEOUT_MS=5000
-export MC_SSD_TARGETS_JSON='[
-  {
-    "name":"t1",
-    "trtype":"tcp",
-    "traddr":"<TARGET_IP>",
-    "trsvcid":"4420",
-    "subnqn":"nqn.2026-03.io.mooncake:ssdpool",
-    "nsid":1,
-    "capacity_bytes":8589934592,
-    "weight":1
-  }
-]'
-```
-
-说明：
-- 需以 `STORE_USE_SPDK=ON` 编译。
-- `nvmeof_client_impl=spdk` 时若 target 不可达，客户端按 fail-fast 失败。
-
-### 8.3 一键执行（SSD-only Put/Get + BatchPut/BatchGet）
-
-```bash
-bash -lc '
-set -euo pipefail
-cd /Users/miaomili/Documents/Playground/MoonCake-personal
-
-# 1) 建议先用 legacy 模式跑通
-export MC_DDR_POOL_ENABLED=0
-export MC_SSD_POOL_ENABLED=1
-export MC_NVMEOF_CLIENT_IMPL=legacy
-export MC_SSD_POOL_TARGETS=file:///tmp/mooncake-ssd-only.bin
-export MC_SSD_POOL_CAPACITY_BYTES=$((8 * 1024 * 1024 * 1024))
-export MC_SSD_POOL_BLOCK_SIZE=4096
-export MC_SSD_QUEUE_LIMIT=1024
-export MC_SSD_IO_TIMEOUT_MS=5000
-
-pkill -f mooncake_master || true
-rm -f /tmp/mooncake_master.log /tmp/mooncake_clientctl_ssd_only.out
-
-./build-remerge/mooncake-store/src/mooncake_master \
-  --rpc_port=50051 \
-  --rpc_thread_num=2 \
-  --enable_ha=false \
-  --enable_http_metadata_server=false \
-  > /tmp/mooncake_master.log 2>&1 &
-MASTER_PID=$!
-trap "kill $MASTER_PID 2>/dev/null || true" EXIT
-
-for i in $(seq 1 30); do
-  nc -z 127.0.0.1 50051 && break || sleep 1
-done
-nc -z 127.0.0.1 50051
-
-cat <<'"'"'EOF'"'"' | ./build-remerge/mooncake-store/tests/e2e/clientctl \
-  --master_server_entry=127.0.0.1:50051 \
-  --engine_meta_url=P2PHANDSHAKE \
-  --protocol=tcp \
-  > /tmp/mooncake_clientctl_ssd_only.out 2>&1
-create c1 51001
-mount c1 seg1 67108864
-put c1 ssd_only_k1 hello_ssd_only
-get c1 ssd_only_k1
-terminate
-EOF
-
-cat /tmp/mooncake_clientctl_ssd_only.out
-
-./build-remerge/mooncake-store/tests/client_integration_test \
-  --gtest_filter=ClientIntegrationTest.BatchPutGetOperations
-'
-```
-
-通过标准：
-- `clientctl` 输出包含 `Get value: hello_ssd_only`
-- `client_integration_test` 退出码 `0` 且无 `FAILED` 用例
-
-## 9. 新增配置总表（部署必读）
-
-说明：
-- 下表按当前 `ssd_tier` 实现整理，面向 `DDR+SSD` 与 `SSD-only` 部署。
-- V1 默认配置生效方式：`master/client` 重启后生效。
-- `MC_SSD_TARGETS_JSON` 是推荐配置；`MC_SSD_POOL_TARGETS` 系列是兼容 fallback。
-
-| 变量名 | 默认值 | 是否必填 | 生效侧 | 作用 |
-|---|---|---|---|---|
-| `MC_DDR_POOL_ENABLED` | `true` | 否 | master | DDR tier 开关。设为 `0` 可启用 SSD-only 语义。 |
-| `MC_SSD_POOL_ENABLED` | `false` | 是（启用 SSD 时） | master | SSD pool 总开关。未开启则不会分配 `SSD_POOL` 副本。 |
-| `MC_NVMEOF_CLIENT_IMPL` | `spdk` | 否 | master（下发）+ client（执行） | NVMeoF 客户端模式，支持 `spdk`/`legacy`。非法值会回退为 `spdk`。 |
-| `MC_SPDK_REACTOR_CORES` | `1` | 否 | master（下发） | SPDK reactor 核数，自动钳制到 `[1,6]`。 |
-| `MC_SSD_QUEUE_LIMIT` | `1024` | 否 | master（下发）+ client | SSD I/O 队列上限（有界排队）。 |
-| `MC_SSD_IO_TIMEOUT_MS` | `5000` | 否 | master（下发）+ client | SSD I/O 超时（毫秒）。 |
-| `MC_SSD_AUTO_FALLBACK_ENABLED` | `false` | 否 | master（下发）+ client | 兼容字段；V1 仅透传，客户端会打印“ignored in V1”。 |
-| `MC_SSD_TARGETS_JSON` | 空 | 推荐必填（启用 SSD 时） | master + client | 每 target 独立配置（推荐）。支持 `trtype=tcp` 与权重。 |
-| `MC_SSD_POOL_TARGETS` | 空 | 条件必填（未配置 JSON 时） | master + client | 兼容模式 target 列表（逗号分隔），例如 `ip:port` 或 `file://...`。 |
-| `MC_SSD_POOL_SUBSYSTEM_NQN` | `nqn.2026-03.io.mooncake:ssdpool` | 否 | master + client | 兼容模式下的 NQN。 |
-| `MC_SSD_POOL_NSID` | `1` | 否 | master + client | 兼容模式下的 NSID。 |
-| `MC_SSD_POOL_CAPACITY_BYTES` | `1<<40`（每 target 1TB） | 否 | master | 兼容模式下每 target 容量账本。 |
-| `MC_SSD_POOL_BLOCK_SIZE` | `4096` | 否 | master | SSD extent 块大小（字节）。 |
-
-### 9.1 `MC_SSD_TARGETS_JSON` 推荐格式
-
-```json
-[
-  {
-    "name": "t1",
-    "trtype": "tcp",
-    "traddr": "127.0.0.1",
-    "trsvcid": "4420",
-    "subnqn": "nqn.2026-03.io.mooncake:ssdpool",
-    "nsid": 1,
-    "capacity_bytes": 8589934592,
-    "weight": 1
-  }
-]
-```
-
-### 9.2 部署侧注意事项
-
-1. `master` 与 `client` 都需要看到一致的 target 配置（至少 `target/nqn/nsid` 一致）。
-2. 使用 `spdk` 模式时必须保证二进制以 `STORE_USE_SPDK=ON` 构建，否则按 fail-fast 失败。
-3. 当 `MC_SSD_POOL_ENABLED=1` 但 target 配置为空或无效时，master 会禁用 SSD pool。
+4. `TC-SPDK-02` 在长时运行中失败
+- 常见原因：SPDK 连接超时或 target 不稳定。
+- 处理：检查 target 健康状态、网络链路与 `MC_SSD_TARGETS_JSON` 配置一致性。

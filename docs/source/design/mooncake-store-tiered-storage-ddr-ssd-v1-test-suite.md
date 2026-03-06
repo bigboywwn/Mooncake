@@ -1,91 +1,71 @@
-# Mooncake DDR+SSD 合并门禁测试集（V1）
+# Mooncake SPDK-Only 合并门禁 E2E 测试集（V2）
 
 ## 1. 目的
 
-本测试集用于验收以下闭环是否成立：
+本门禁集用于验证以下闭环：
 
-1. 审查阻塞项 `B1/B2/B3/B4` 全部关闭。
-2. `SSD-only`（`MC_DDR_POOL_ENABLED=0, MC_SSD_POOL_ENABLED=1`）可运行。
-3. `Put/Get/Query/BatchQuery` 接口兼容不变。
-4. SSD 路径仍满足 Store-only（不进入 TE）。
+1. `DDR/SSD/remoteFS` 组合语义在真实环境保持一致。
+2. `SPDK + 3 target` 主路径稳定可用。
+3. `Put/Get/Query/BatchQuery/BatchGet/BatchPut` 无回归。
+4. fail-fast、可观测性具备可判定结果。
 
-## 2. 测试范围
+## 2. 强约束
 
-覆盖范围：
+1. 仅执行 `e2e`（真实部署 `master/client/store/target`）。
+2. 不执行 `gtest`。
+3. 不覆盖 `legacy target`。
+4. SSD 相关场景固定 3 target。
 
-1. 语义正确性：写确认点、读降级、副本排序、回收一致性。
-2. 资源闭环：extent 分配/释放、evict 触发路径可观测。
-3. 启动与容错：fail-fast、异步写结果上报闭环。
+## 3. 门禁矩阵
 
-不覆盖：
+| Case | Profile | Priority | 预期 |
+|---|---|---|---|
+| TC-CFG-01 | T1~T7 | P0 | `enabled_tiers` 与 profile 一致，`impl=spdk` |
+| TC-RW-01 | T1~T7 | P0 | 单 key `Put/Get` 成功且值一致 |
+| TC-RW-02 | T1~T7 | P1 | `BatchPut/BatchQuery/BatchGet` 全成功 |
+| TC-RFS-01 | T3/T5/T6/T7 | P1 | client 重启后数据可读 |
+| TC-SPDK-01 | T2/T4/T6/T7 | P0 | runner 识别到 3 个 target |
+| TC-SPDK-02 | T2/T4/T6/T7 | P1 | 300 keys 分布命中 3 target，分布可接受 |
+| TC-SPDK-03 | SSD 代表场景 | P0 | 不可达 target 下 client fail-fast |
+| TC-OBS-01 | 全阶段 | P0 | 关键指标可抓取且可变化 |
 
-1. 极限性能压测。
-2. 多租户 QoS。
-3. 自动回退状态机（V1 未实现）。
+## 4. DoD
 
-## 3. 门禁用例矩阵
+1. **DoD-CFG**：配置面结果与 profile 严格一致。
+2. **DoD-RW**：核心 API 在全组合无功能回归。
+3. **DoD-SPDK**：SPDK 3-target 场景可运行、可分布、可 fail-fast。
+4. **DoD-OBS**：关键指标可用于定位问题。
 
-| 用例 ID | 目标 | 前置条件 | 核心步骤 | 期望结果 | 证据类型 | DoD 映射 |
-|---|---|---|---|---|---|---|
-| TC-B1-01 | BatchGet 首副本为 SSD 可读 | `DDR+SSD`，构造 SSD 首副本 key | 执行 `BatchQuery + BatchGet` | 读取成功，无 `INVALID_REPLICA` | client log + 返回码 | DoD-B1 |
-| TC-B1-02 | BatchGet memory 失败后降级 | 人工制造 memory 读失败 | 执行 `BatchGet` | 自动回退到 SSD/remoteFS，返回成功 | client log + fallback trace | DoD-B1 |
-| TC-B2-01 | 同 key 选路稳定 | 多 target，consistent hash 启用 | 重启前后重复 `PutStart` 同 key | `target_endpoint` 稳定 | `PutStart` 返回值 | DoD-B2 |
-| TC-B2-02 | 权重生效 | target weight 不同 | 多 key 分配统计 | 分布近似权重比例，重权重 target 命中更多 | 分配统计日志/脚本输出 | DoD-B2 |
-| TC-B2-03 | 三 target 场景可运行 | `MC_SSD_POOL_TARGETS=file://...` 配置 3 个内存盘 target | 执行 `client_integration_test` | 日志出现 `SSDPoolManager initialized, targets=3`，核心用例可执行 | client log | DoD-B2 |
-| TC-B3-01 | clear_all 释放闭环 | 小容量 SSD 池 | `PutStart/PutEnd` 后 `BatchReplicaClear(clear_all)` | extent 可复用，后续分配成功 | master log + 后续 PutStart | DoD-B3 |
-| TC-B3-02 | segment 清理释放精确 | 指定 segment 清理 | `BatchReplicaClear(segment)` | 仅命中副本释放，账本不泄漏 | master log + metric | DoD-B3 |
-| TC-B4-01 | fail-fast 启动语义 | SSD tier 启用且 SsdIoEngine 初始化失败 | 启动 client | 启动失败，不允许静默继续 | 启动日志 + 退出码 | DoD-B4 |
-| TC-B4-02 | 异步写失败回收闭环 | 注入 SSD 异步写失败 | 触发 `PutToSsdPool` 失败上报 | `PutRevoke(SSD_POOL)` 生效，无残留 PROCESSING | master metadata + log | DoD-B4 |
-| TC-B4-03 | SPDK 多 client 初始化稳定性 | `MC_NVMEOF_CLIENT_IMPL=spdk`，同进程创建多个 client | 重复初始化/销毁 client | 无 `spdk_env_init` 重入崩溃，失败可判定 | client log + 退出码 | DoD-B4 |
-| TC-SSDONLY-01 | SSD-only 单 key 可用 | `MC_DDR_POOL_ENABLED=0` + SSD 启用 | 单 key `Put/Get` | 成功且值一致 | 返回码 + 数据校验 | DoD-SSDONLY |
-| TC-SSDONLY-02 | SSD-only 批量可用 | 同上 | `BatchPut/BatchGet` | 全量成功，无静默错误 | 返回码 + 批量校验 | DoD-SSDONLY |
-| TC-OBS-01 | 关键指标可观测 | 完成上述读写/失败路径 | 拉取 metrics | `ssd_spdk_io_*`、`ssd_connect_fail_total`、`master_ssd_extent_release_fail_total`、`ssd_queue_full_total`、`ssd_reactor_cpu_usage_pct`、`ssd_async_sink_queue_depth`、`ssd_async_sink_queue_lag_ms` 有暴露且可变化 | metrics 抓取结果 | DoD-OBS |
-| TC-BOUNDARY-01 | TE 边界约束 | 构造 SSD 读写请求 | 执行读写并检查日志 | SSD 请求不进入 `TransferSubmitter` SSD 分支 | transfer log/assert | DoD-BOUNDARY |
+## 5. 执行命令（统一入口）
 
-## 4. DoD 定义
+1. 编译（固定 `-j3`）：
 
-1. **DoD-B1**：批量读取在 SSD/non-memory 场景不再回归失败。
-2. **DoD-B2**：`policy=consistent_hash` 与实现一致，选路稳定且可表达权重。
-3. **DoD-B3**：`BatchReplicaClear` 不产生 SSD extent 容量泄漏。
-4. **DoD-B4**：启动与异步写失败路径均闭环，无静默降级。
-5. **DoD-SSDONLY**：在关闭 DDR 时仍可完成核心读写。
-6. **DoD-OBS**：关键故障与容量信号可观测。
-7. **DoD-BOUNDARY**：SSD I/O 不进入 TE。
+```bash
+cmake --build /Users/miaomili/Documents/Playground/MoonCake-personal/build-spdk \
+  --target mooncake_master mooncake_client clientctl tiered_e2e_runner \
+  -j3
+```
 
-## 5. 执行建议
+2. 执行矩阵：
 
-1. 先跑单测：`master_service_ssd_test`（B2/B3 基线）。
-2. 再跑功能联调：`DDR+SSD` 与 `SSD-only` 两套配置。
-3. 加跑 3-target 专项：使用内存盘 `file://` 目标验证 `targets=3` 初始化和稳定性。
-4. 最后跑门禁回归：覆盖 `BatchGet`、fail-fast、指标拉取。
+```bash
+/Users/miaomili/Documents/Playground/MoonCake-personal/mooncake-store/tests/e2e/scripts/run_realenv_matrix.sh
+```
 
-## 6. 当前实现态参考结果（2026-03-06，ubuntu-test）
+3. 报告输出：
 
-已完成的验证样例：
+- `artifacts/e2e-spdk-realenv-<sha>-<ts>/summary.csv`
+- `artifacts/e2e-spdk-realenv-<sha>-<ts>/E2E_TEST_REPORT.md`
 
-1. 基线（默认环境）：
-   - `master_service_ssd_test`：20/20 PASS。
-   - `master_metrics_test`：5/5 PASS。
-   - `client_integration_test`：15/15 PASS。
-2. 3-target 专项（`MC_SSD_POOL_TARGETS=file:///dev/shm/...` 三个内存盘）：
-   - `client_integration_test`：15 tests, 2 FAILED。
-   - 失败项：`ClientIntegrationTest.RemoveOperation`、`ClientIntegrationTest.ReplicaCopyAndMoveOperations`。
-   - 生效证据：日志命中 `SSDPoolManager initialized, targets=3`。
+## 6. Blocked 规则
 
-说明：
-1. 本轮为功能与契约门禁，不含极限性能压测。
-2. `TC-B2-01` 的“重启前后稳定性”使用同 key 重复 `PutStart` + 重建服务验证；更大样本统计可作为后续性能专项脚本。
-3. 3-target 专项暴露了当前代码在部分集成用例上的兼容性问题，需单独跟踪修复后回归。
+以下情况标记 `BLOCKED`，不计入功能失败：
 
-## 7. 复现实验命令（与代码一致）
+1. target 进程不可用或网络阻塞导致环境无法建链。
+2. 监控端口不可达导致 `TC-OBS-01` 无法抓取。
 
-1. 编译（SPDK on）：
-`cmake --build /Users/miaomili/Documents/Playground/MoonCake-personal/build-spdk --target mooncake_store mooncake_master mooncake_client clientctl master_service_ssd_test master_metrics_test client_integration_test -j3`
-2. 运行 `master_service_ssd_test`：
-`/Users/miaomili/Documents/Playground/MoonCake-personal/build-spdk/mooncake-store/tests/master_service_ssd_test`
-3. 运行 `master_metrics_test`：
-`/Users/miaomili/Documents/Playground/MoonCake-personal/build-spdk/mooncake-store/tests/master_metrics_test`
-4. 运行 `client_integration_test`（需 SPDK 动态库路径）：
-`LD_LIBRARY_PATH=/Users/miaomili/Documents/Playground/Mooncake/extern/spdk-23.01/build/lib:/Users/miaomili/Documents/Playground/Mooncake/extern/spdk-23.01/dpdk/build-tmp/lib:$LD_LIBRARY_PATH /Users/miaomili/Documents/Playground/MoonCake-personal/build-spdk/mooncake-store/tests/client_integration_test`
-5. 运行 3-target 内存盘专项（legacy）：
-`truncate -s 256M /dev/shm/mc-nvme-target-0.img && truncate -s 256M /dev/shm/mc-nvme-target-1.img && truncate -s 256M /dev/shm/mc-nvme-target-2.img && MC_DDR_POOL_ENABLED=1 MC_SSD_POOL_ENABLED=1 MC_NVMEOF_CLIENT_IMPL=legacy MC_SSD_POOL_TARGETS=file:///dev/shm/mc-nvme-target-0.img,file:///dev/shm/mc-nvme-target-1.img,file:///dev/shm/mc-nvme-target-2.img MC_SSD_POOL_CAPACITY_BYTES=268435456 MC_SSD_POOL_BLOCK_SIZE=4096 /Users/miaomili/Documents/Playground/MoonCake-personal/build-e2e/mooncake-store/tests/client_integration_test`
+## 7. 已删除项（V1 -> V2）
+
+1. 删除所有 `legacy` 用例与命令。
+2. 删除 `master_service_ssd_test/master_metrics_test/client_integration_test` 作为测试角色门禁执行项。
+3. 删除 `MC_SSD_POOL_TARGETS=file://...` legacy 3-target 专项执行方式。

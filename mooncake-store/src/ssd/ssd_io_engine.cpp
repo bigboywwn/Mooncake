@@ -218,7 +218,8 @@ void SpdkIoCompletionCb(void* arg, const spdk_nvme_cpl* cpl) {
     ctx->done.store(true, std::memory_order_release);
 }
 
-ErrorCode WaitSpdkCompletion(spdk_nvme_qpair* qpair, SpdkIoCompletion& completion,
+ErrorCode WaitSpdkCompletion(spdk_nvme_qpair* qpair, spdk_nvme_ctrlr* ctrlr,
+                             SpdkIoCompletion& completion,
                              uint32_t io_timeout_ms) {
     const auto deadline =
         std::chrono::steady_clock::now() +
@@ -228,6 +229,12 @@ ErrorCode WaitSpdkCompletion(spdk_nvme_qpair* qpair, SpdkIoCompletion& completio
         const int rc = spdk_nvme_qpair_process_completions(qpair, 0);
         if (rc < 0) {
             return ErrorCode::SSD_IO_SUBMIT_FAIL;
+        }
+        if (ctrlr != nullptr) {
+            const int admin_rc = spdk_nvme_ctrlr_process_admin_completions(ctrlr);
+            if (admin_rc < 0) {
+                return ErrorCode::SSD_IO_SUBMIT_FAIL;
+            }
         }
         if (std::chrono::steady_clock::now() > deadline) {
             return ErrorCode::SSD_IO_TIMEOUT;
@@ -599,6 +606,9 @@ bool SsdIoEngine::EnsureSpdkSessionForTarget(const SsdIoTargetConfig& target,
 
     spdk_nvme_ctrlr_opts ctrlr_opts = {};
     spdk_nvme_ctrlr_get_default_ctrlr_opts(&ctrlr_opts, sizeof(ctrlr_opts));
+    // This engine runs synchronous data-path polling only. Disable KATO to avoid
+    // keep-alive timeout when admin completions are not pumped by a background thread.
+    ctrlr_opts.keep_alive_timeout_ms = 0;
 
     spdk_nvme_ctrlr* ctrlr =
         spdk_nvme_connect(&trid, &ctrlr_opts, sizeof(ctrlr_opts));
@@ -767,8 +777,9 @@ ErrorCode SsdIoEngine::DoSpdkWrite(const SsdExtentDescriptor& extent,
             MasterMetricManager::instance().inc_ssd_spdk_io_fail_total();
             return ErrorCode::SSD_IO_SUBMIT_FAIL;
         }
-        const auto wait_rc = WaitSpdkCompletion(
-            session->qpair, rmw_read_completion, config_.io_timeout_ms);
+        const auto wait_rc =
+            WaitSpdkCompletion(session->qpair, session->ctrlr, rmw_read_completion,
+                               config_.io_timeout_ms);
         if (wait_rc != ErrorCode::OK) {
             spdk_dma_free(dma_buf);
             MasterMetricManager::instance().inc_ssd_spdk_io_timeout_total();
@@ -792,7 +803,8 @@ ErrorCode SsdIoEngine::DoSpdkWrite(const SsdExtentDescriptor& extent,
     }
 
     const auto wait_rc =
-        WaitSpdkCompletion(session->qpair, write_completion, config_.io_timeout_ms);
+        WaitSpdkCompletion(session->qpair, session->ctrlr, write_completion,
+                           config_.io_timeout_ms);
     spdk_dma_free(dma_buf);
     if (wait_rc != ErrorCode::OK) {
         MasterMetricManager::instance().inc_ssd_spdk_io_timeout_total();
@@ -868,7 +880,8 @@ ErrorCode SsdIoEngine::DoSpdkRead(const SsdExtentDescriptor& extent,
     }
 
     const auto wait_rc =
-        WaitSpdkCompletion(session->qpair, read_completion, config_.io_timeout_ms);
+        WaitSpdkCompletion(session->qpair, session->ctrlr, read_completion,
+                           config_.io_timeout_ms);
     if (wait_rc != ErrorCode::OK) {
         spdk_dma_free(dma_buf);
         MasterMetricManager::instance().inc_ssd_spdk_io_timeout_total();

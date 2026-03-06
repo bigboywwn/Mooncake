@@ -13,6 +13,16 @@ target_link_libraries(clientctl PUBLIC
     ${ETCD_WRAPPER_LIB}
 )
 
+add_executable(tiered_e2e_runner tiered_e2e_runner.cpp ${MOONCAKE_E2E_TEST_SOURCES})
+target_link_libraries(tiered_e2e_runner PUBLIC
+    mooncake_store
+    transfer_engine
+    cachelib_memory_allocator
+    glog
+    pthread
+    ${ETCD_WRAPPER_LIB}
+)
+
 add_executable(e2e_rand_test e2e_rand_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(e2e_rand_test PUBLIC
     mooncake_store
