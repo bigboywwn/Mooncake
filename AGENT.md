@@ -223,3 +223,49 @@ cat /tmp/mooncake_clientctl_ssd_only.out
 通过标准：
 - `clientctl` 输出包含 `Get value: hello_ssd_only`
 - `client_integration_test` 退出码 `0` 且无 `FAILED` 用例
+
+## 9. 新增配置总表（部署必读）
+
+说明：
+- 下表按当前 `ssd_tier` 实现整理，面向 `DDR+SSD` 与 `SSD-only` 部署。
+- V1 默认配置生效方式：`master/client` 重启后生效。
+- `MC_SSD_TARGETS_JSON` 是推荐配置；`MC_SSD_POOL_TARGETS` 系列是兼容 fallback。
+
+| 变量名 | 默认值 | 是否必填 | 生效侧 | 作用 |
+|---|---|---|---|---|
+| `MC_DDR_POOL_ENABLED` | `true` | 否 | master | DDR tier 开关。设为 `0` 可启用 SSD-only 语义。 |
+| `MC_SSD_POOL_ENABLED` | `false` | 是（启用 SSD 时） | master | SSD pool 总开关。未开启则不会分配 `SSD_POOL` 副本。 |
+| `MC_NVMEOF_CLIENT_IMPL` | `spdk` | 否 | master（下发）+ client（执行） | NVMeoF 客户端模式，支持 `spdk`/`legacy`。非法值会回退为 `spdk`。 |
+| `MC_SPDK_REACTOR_CORES` | `1` | 否 | master（下发） | SPDK reactor 核数，自动钳制到 `[1,6]`。 |
+| `MC_SSD_QUEUE_LIMIT` | `1024` | 否 | master（下发）+ client | SSD I/O 队列上限（有界排队）。 |
+| `MC_SSD_IO_TIMEOUT_MS` | `5000` | 否 | master（下发）+ client | SSD I/O 超时（毫秒）。 |
+| `MC_SSD_AUTO_FALLBACK_ENABLED` | `false` | 否 | master（下发）+ client | 兼容字段；V1 仅透传，客户端会打印“ignored in V1”。 |
+| `MC_SSD_TARGETS_JSON` | 空 | 推荐必填（启用 SSD 时） | master + client | 每 target 独立配置（推荐）。支持 `trtype=tcp` 与权重。 |
+| `MC_SSD_POOL_TARGETS` | 空 | 条件必填（未配置 JSON 时） | master + client | 兼容模式 target 列表（逗号分隔），例如 `ip:port` 或 `file://...`。 |
+| `MC_SSD_POOL_SUBSYSTEM_NQN` | `nqn.2026-03.io.mooncake:ssdpool` | 否 | master + client | 兼容模式下的 NQN。 |
+| `MC_SSD_POOL_NSID` | `1` | 否 | master + client | 兼容模式下的 NSID。 |
+| `MC_SSD_POOL_CAPACITY_BYTES` | `1<<40`（每 target 1TB） | 否 | master | 兼容模式下每 target 容量账本。 |
+| `MC_SSD_POOL_BLOCK_SIZE` | `4096` | 否 | master | SSD extent 块大小（字节）。 |
+
+### 9.1 `MC_SSD_TARGETS_JSON` 推荐格式
+
+```json
+[
+  {
+    "name": "t1",
+    "trtype": "tcp",
+    "traddr": "127.0.0.1",
+    "trsvcid": "4420",
+    "subnqn": "nqn.2026-03.io.mooncake:ssdpool",
+    "nsid": 1,
+    "capacity_bytes": 8589934592,
+    "weight": 1
+  }
+]
+```
+
+### 9.2 部署侧注意事项
+
+1. `master` 与 `client` 都需要看到一致的 target 配置（至少 `target/nqn/nsid` 一致）。
+2. 使用 `spdk` 模式时必须保证二进制以 `STORE_USE_SPDK=ON` 构建，否则按 fail-fast 失败。
+3. 当 `MC_SSD_POOL_ENABLED=1` 但 target 配置为空或无效时，master 会禁用 SSD pool。
